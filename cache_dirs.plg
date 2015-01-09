@@ -1,0 +1,1430 @@
+<?xml version='1.0' standalone='yes'?>
+<PLUGIN>
+
+<!--
+2012-04-16 0.1-1jr - first release
+2012-04-17 0.2-1jr - added event handelers
+2012-04-23 0.3-1jr - Added unRaid V5.0 menus
+2012-04-27 0.4-1jr - Cleaned up some obsolete code
+2012-05-01 0.5-1jr - Corrected a bug preventing the include and exclude options from working correctly (thanks to mp328 for pointing it out)
+                     fixed a bug in the clean up script preventing updates from older scripts from working.
+2012-05-02 0.6-1jr - Corrected a bug in the rc.cache_dir script causing an error on some systems when executing
+2012-05-03 0.7-1jr - Corrected a typo in the rc.cache_dir script
+2013-01-24 1.6.7-1jr - Updated to V1.6.7 of cache_dirs. Version number of plugin now relates to version number of cache_dirs
+2013-02-05 1.6.7-2jr - Added cache_pressure to the config screen
+2013-02-12 1.6.7-3jr - Bugfix in config code and cosmetic fix on settings page
+2013-02-13 1.6.7-4jr - More fixes to the config screen
+alex - Unmounting disks event stop cache_dirs + StartDelayed (when mounting disks) + rc.cache_dirs changes
+2015-01-04 2.0.0-arb - cache_dir script changes - see version comments in scripts
+                       PLG change: Force-disk-busy default no
+
+This Plugin installs the cache_dirs script created by Joe L, and a start/stop script into the /etc/rc.d/unraid.d folder.
+You can manually start cache_dirs using
+/etc/rc.d/rc.cache_dirs start
+and stop the script with
+/etc/rc.d/rc.cache_dirs stop
+-->
+
+
+
+<!-- Remove the old scripts if they exist -->
+<FILE Name="/tmp/cache_dirs-cleanup.sh" Run="/bin/bash" Mode="0770">
+<INLINE>
+<![CDATA[
+#!/bin/bash
+
+rm -rf /usr/local/emhttp/plugins/cache_dirs
+rm -f /etc/rc.d/rc.cache_dirs
+rm -f /usr/sbin/cache_dirs
+rm -f /tmp/cache_dirs-cleanup.sh
+]]>
+</INLINE>
+</FILE>
+
+
+
+
+<!-- create the cache_dirs script -->
+<FILE Name="/usr/sbin/cache_dirs" Mode="0770">
+<INLINE>
+<![CDATA[
+#!/bin/bash
+if test "$SHELL" = "/bin/sh" && test -x /bin/bash; then
+    exec /bin/bash -c "$0" "$@"
+fi
+
+####################################################################################
+# cache_dirs
+# A utility to attempt to keep directory entries in the linux
+# buffer cache to allow disks to spin down and no need to spin-up
+# simply to get a directory listing on an unRAID server.
+#
+# Version 1.0   Initial proof of concept using "ls -R"
+# Version 1.1   Working version, using "ls -R" or "find -maxdepth"
+# Version 1.2   Able to be used with or without presence of user-shares.  
+#               Removed "ls -R" as it was too easy to run out of ram. (ask me how I know)
+#               Added -i include_dir to explicitly state cached directories
+#               Added -v option, verbose statistics when run in foreground
+#               Added -q option, to easily terminate a process run in the background
+#               Added logging of command line parameters to syslog
+# Version 1.3   Added -w option, to wait till array comes online before starting scan
+#               of /mnt/disk* share folders.
+#               Changed min-seconds delay between scans to 1 instead of 0.
+#               Moved test of include/exclude directories to after array is on-line
+#               Added logging of mis-spelled/missing include/exclude dirs to syslog
+#               Added ability to have shell wildcard expansion in include/exclude names
+# Version 1.4   Fix bug with argument order passed to find when using -d option
+#               Fixed command submitted to "at" to use full path. Should not need to
+#              set PATH variable in "go" script.
+#               Added ability to also cache scan /mnt/user with -u option
+# Version 1.4.1 Fixed version comment so it is actually a comment.
+# Version 1.5   Added -V to print version number.
+#               Added explicit cache of root directories on disks and cache drive
+#               Modified "average" scan time statistic to be weighted average with a window
+#               of recent samples.
+#               Added -a args option to allow entry of args to commands after dir/file name
+#                 example: cache_dirs -a "-ls" -d 3
+#                 This will execute "find disk/share -ls -maxdepth 3"
+# Version 1.6   - Fixed bug... if -q was used, and cache_dirs not currently running, 
+#               it started running in error. OOps... Added the missing "exit"
+#               - Changed vfs_cache_pressure setting to be 1 instead of 0 by default.
+#               - Added "-p cache_pressure" to allow experimentation with vfs_cache_pressure values
+#                (If not specified, default value of 1 will be used)
+#               - Made -noleaf the default behavior for the "find" command (use -a "" to disable).
+#               - Added logic to force all disks "busy" by starting a process with each as their
+#               current working directory.   This will prevent a user from seeing a frightening
+#               Unformatted description if they attempt to stop the array.  A second "Stop" will
+#               succeed (the scan is paused for 2 minutes, so it may be stopped cleanly)
+#               - Added new -B option to revert to the old behaviour and not force disks busy if by 
+#               chance this new feature causes problems for some users.
+#               - Allow min seconds to be equal to max seconds in loop delay range.
+#               - Added run-time-logging, log name = /var/log/cache_dirs.log 
+# Version 1.6.1 - Fixed bug. Added missing /mnt/cache disk to scanned directories
+# Version 1.6.2 - Added trap to clean up processes after kill signal when run in background
+# Version 1.6.3 - Modified to deal with new un-mounting message in syslog in 4.5b7 to 
+#                 allow array shutdown to occur cleanly.
+# Version 1.6.4 - Modified to suspend scan during time "mover" script is running to prevent 
+#                 DuplicateFile messages from occurring as file is being copied.
+#               - Added -S option to NOT suspend scan during mover process.
+#               - Added logic to re-invoke cache_dirs if array is stopped and then re-started
+#                 by submitting command string to "at" to re-invoke in a minute. 
+#               - Added entry to "usage()" function for -B
+# Version 1.6.5 - Fixed what I broke in looking for "mover" pid to suspend during the "mover"
+#                 to eliminate warnings in syslog about duplicate files detected while files were
+#                 being copied.
+# Version 1.6.6 - Fixed mover-detection to use the exact same logic as "mover" (and fixed stupid typo I had made)
+# Version 1.6.7 - Added cache_pressure to "usage" statement, fixed bug where it reverted to 10 after being invoked through "at"
+#                 when used with the -w option.
+# Version 1.6.8 - Added -U NNNNN option to set ulimit, and detection of 64 bit OS so odds are this new option will not be needed.
+#                 by default, ulimit is set to 5000 on 32 bit OS, and 30000 on 64 bit OS.  Either can be over-ridden with -U NNNNN on command line
+# Version 1.6.9 - Removed exec of /bin/bash.  Newer bash was not setting SHELL variable causng infinate loop if invoked from "go" script.
+#                 Changed default ulimit on 64 bit systems to 50000. 
+#                 by default, ulimit is now set to 5000 on 32 bit OS, and 50000 on 64 bit OS.  Either can be over-ridden with -U NNNNN on command line
+#                 Setting ulimit to zero ( with "-U 0" option) is now special, cache_dirs will not set any ulimit at all.  You'll inherit the system value, whatever it might be.
+# Joe L.
+#
+# Version 2.0.0   Added gradual depth to avoid continous scans of filesystem, monitor of disk-idle, and better user-feedback as to disk spin-up in log-file.
+#                 Now stops cache_dirs immediately on stop signal (eg array stop) including stopping the currently running find-process.
+#                 Force-disk-busy now defaults no and inverted flag (and changed -B to -b) because it was (mostly) unRaid 4 and its unnessary when using plg with unmount disk event.
+# arberg
+####################################################################################
+version=2.0.0
+program_name=`basename $0`
+program_dir=`dirname $0`
+arg_count=$#
+
+usage() {
+ echo
+ echo "Usage: $program_name [-m min_seconds] [-M max_seconds] [-F] [-d maxdepth] [-c command] [-a args] [-e exclude_dir] [-i include_dir] [-w]"
+ echo "       $program_name -V      = print program version "
+ echo "       $program_name -q"
+ echo "       $program_name -l on   = turn on logging to /var/log/cache_dirs.log"
+ echo "       $program_name -l off  = turn off logging to /var/log/cache_dirs.log"
+ echo " -w       =   wait for array to come online before start of cache scan of directories"
+ echo " -m NN    =   minimum seconds to wait between directory scans (default=1)"
+ echo " -M NN    =   maximum seconds to wait between directory scans (default=10)"
+ echo " -U NN    =   set ulimit to NN to limit memory used (default=5000 on 32 bit, 50000 on 64 bit OS, '-U 0' sets no ulimit at all)"
+ echo " -F       =   do NOT run in background, run in Foreground and print statistics as it loops and scans"
+ echo " -v       =   when used with -F, verbose statistics are printed as directories are scanned"
+ echo " -s       =   shorter-log - print count of directories scanned to syslog instead of their names"
+ echo " -d NN    =   use \"find -maxdepth NN\" instead of \"find -maxdepth 999\" "
+ echo " -c command   = use command instead of \"find\" "
+ echo "              ("command" should be quoted if it has embedded spaces)"
+ echo " -a args    = append args to command"
+ echo " -u       =   also scan /mnt/user (scan user shares)"
+ echo " -e exclude_dir  (may be repeated as many times as desired)"
+ echo " -i include_dir  (may be repeated as many times as desired)"
+ echo " -p NN    =   set cache_pressure to NN (by default it is set to 10)"
+ echo " -b       =   force disks busy (to prevent unmounted disks showing as unformatted, especially unraid <= 4)"
+ echo " -S       =   do not suspend scan during 'mover' process"
+ echo " -z       = concise log (log run criteria on one line)"
+ echo " -q       = terminate any background instance of cache_dirs"
+}
+
+# if we detect an attempt to stop the array without quiting this cache_dirs program we will
+# suspend the scanning of directories for a duration to allow a clean Stop of the array.
+# (Basically, on older versions of unRAID, press the "Stop" button again within this window of time as first will NOT
+# stop the array since we have forced  all the disks busy. Newer versions of unRAID will loop until the disks are all not "busy")
+suspend_secs=120
+
+background=yes
+verbose=no
+min_seconds=1
+max_seconds=10
+use_find=no
+short_log=no
+maxdepth=9999
+command="find"
+window_array_length=20
+avg_elapsed_time=0
+exclude_array_count=0
+include_array_count=0
+quit_flag="no"
+force_disk_busy_flag="no"
+suspend_during_mover="yes"
+wait_flag="no"
+commandargs=$*
+user_share_dir=""
+args="-noleaf"
+concise_log="no"
+run_log="/var/log/cache_dirs.log"
+debug_output=0
+scan_timeout_sec=600
+scan_judge_as_failure_sec=10
+##7 seems sane without timeout or with large scan_timeout_sec
+depth_maxscans_with_disc_access=7
+depth_max_incremental_depth=20
+scheduled_next_depth_increment_timer_duration_sec=108000
+
+uname -m | grep "64" >/dev/null 2>&1
+if [ $? = 0 ]
+then
+  OS_64_BIT=true
+  ulimit_mem=50000
+  force_disk_busy_flag="no"
+else
+  OS_64_BIT=false
+  ulimit_mem=5000
+fi
+
+# Constants
+NANO_PR_SEC=1000000000
+
+# cache_pressure of 0 will potentially run out of RAM if a large directory is scanned and not enough RAM
+# esists. User processes will then be killed to free space rather than cache freed.  
+# (It has happened several times on my server when I forgot to exclude my data folder. 
+# It is not fun trying to regain control without a full reboot.  I've changed the default to "1" instead. ) 
+# If you have enough RAM, and few enough files being cached, you can specify "-p 0" on the command line
+# to set the vfs_cache_pressure to 0.  Otherwise, this default value of 1 should prevent memory starvation 
+# and the OOM (out-of-memory) state killing on your processes to free up some RAM.
+# 1 did not do it with my 500Meg of RAM... trying cache_pressure of 10, use -p 1 if you still want the old value
+cache_pressure=10  
+
+verbose_echo() {
+      [ $background = "no" -a $verbose = "yes" ] && echo $1
+}
+
+log() {
+      [ $background = "no" -a $verbose = "yes" ] && echo $1
+      [ "$run_log" != "" -a -f "$run_log" ] && echo $1 >> $run_log
+}
+
+syslog() {
+      [ $background = "no" ] && echo $1
+      [ "$run_log" != "" -a -f "$run_log" ] && echo $1 >> $run_log
+      echo $1 | logger -t$program_name 
+}
+
+while getopts ":p:m:M:Fvc:d:e:qi:szl:bwuVa:SU:" opt; do
+  case $opt in
+  m ) min_seconds=$OPTARG ;;
+  M ) max_seconds=$OPTARG ;;
+  F ) background=no ;;
+  v ) verbose=yes ;;
+  V ) echo $program_name version: $version
+      exit 0 ;;
+  u)  user_share_dir="/mnt/user" ;;
+  c ) command="$OPTARG" ;;
+  a ) args="$OPTARG" ;;
+  d ) maxdepth=$OPTARG 
+      command="find" ;;
+  i ) include_array[$include_array_count]="$OPTARG"
+      include_array_count=$(($include_array_count+1)) ;;
+  e ) exclude_array[$exclude_array_count]="$OPTARG"
+      exclude_array_count=$(($exclude_array_count+1)) ;;
+  h ) usage >&2 ; exit ;;
+  p ) cache_pressure="$OPTARG" ;;
+  U ) ulimit_mem="$OPTARG" ;;
+  q ) quit_flag="yes" ;;
+  w ) wait_flag="yes" ;;
+  s ) short_log="yes" ;;
+  b ) force_disk_busy_flag="yes" ;;
+  S ) suspend_during_mover="no" ;;
+  z ) concise_log="yes" ;;
+  l ) if [ "$arg_count" -ne 2 ]
+      then
+        echo "-l option may not be used in combination with others."
+        echo "Usage:" >&2
+        echo "cache_dirs -l on" >&2
+        echo "or" >&2
+        echo "cache_dirs -l off" >&2
+        exit 2
+      fi
+      case "$OPTARG" in
+      on)
+        echo >$run_log
+        echo "Logging enabled to $run_log"
+        exit 0
+      ;;
+      off)
+        rm "$run_log"
+        echo "Logging to $run_log stopped"
+        exit 0
+      ;;
+      *)
+        echo "Invalid argument to -l option"
+        echo "Usage:" >&2
+        echo "cache_dirs -l on" >&2
+        echo "or" >&2
+        echo "cache_dirs -l off" >&2
+        exit 2
+      ;;
+      esac
+      ;;
+  \?) usage >&2 ; exit ;;
+  esac
+done
+
+#Try to play nice
+if [ "$ulimit_mem" -gt 0 ]
+then
+  log "Setting Memory ulimit to $ulimit_mem"
+  ulimit -v $ulimit_mem
+else
+  log "No Memory ulimit applied"
+fi
+log "Setting maxdepth=$maxdepth"
+
+lockfile="/var/lock/cache_dirs.LCK"
+if [ -f "${lockfile}" ]; then
+
+  # The file exists so read the PID
+  # to see if it is still running
+  lock_pid=`head -n 1 "${lockfile}"`
+
+  pid_running=`ps -p "${lock_pid}" | grep ${lock_pid}`
+
+  if [ -z "${pid_running}" ]; then
+    if [ "$quit_flag" = "no" ]
+    then
+      # The process is not running
+      # Echo current PID into lock file
+      echo $$ > "${lockfile}"
+    else
+      echo "$program_name ${lock_pid} is not currently running "
+      rm "${lockfile}"
+      exit 0
+    fi
+  else
+    if [ "$quit_flag" = "yes" ]
+    then
+      syslog "killing $program_name process $lock_pid"
+      # 1. Remove lock-file so we don't spawn new find-processes 2. kill current find-sub-process 3. Kill parent process
+      rm "${lockfile}"
+      pid_child=$(pgrep -P "$lock_pid")
+      [ -n "${pid_child}" ] && kill "$pid_child"
+      kill "$lock_pid"
+      exit 0
+    else
+      echo "$program_name is already running [${lock_pid}]"
+      exit 2
+    fi
+  fi
+else
+  if [ "$quit_flag" = "yes" ]
+  then
+    echo "$program_name not currently running "
+    exit 0
+  else
+    echo $$ > "${lockfile}"
+  fi
+fi
+
+# validate the cache pressure
+cc="$(echo $cache_pressure | sed 's/[0-9]//g')"
+if [ ! -z "$cc" ]
+then
+  echo "error: cache_pressure must be numeric." >&2
+  usage >&2
+  exit 2
+fi
+
+# validate the min number of seconds
+cc="$(echo $min_seconds | sed 's/[0-9]//g')"
+if [ ! -z "$cc" ]
+then
+  echo "error: min number of seconds must be numeric (whole number, not negative)." >&2
+  usage >&2
+  exit 2
+fi
+
+# validate the max number of seconds
+cc="$(echo $max_seconds | sed 's/[0-9]//g')"
+if [ ! -z "$cc" ]
+then
+  echo "error: max number of seconds must be numeric." >&2
+  usage >&2
+  exit 2
+fi
+if [ $max_seconds -lt $min_seconds ]
+then
+  echo "error: max number of seconds must be greater than or equal min number of seconds." >&2
+  usage >&2
+  exit 2
+fi
+
+# validate the maxdepth
+cc="$(echo $maxdepth | sed 's/[0-9]//g')"
+if [ ! -z "$cc" ]
+then
+  echo "error: directory scan maxdepth must be numeric." >&2
+  usage >&2
+  exit 2
+fi
+
+shift $(($OPTIND - 1))
+
+# start out in the middle of the range allowed.
+num_seconds=$((( $max_seconds + $min_seconds ) / 2 ))
+
+log "Setting cache_pressure=$cache_pressure"
+sysctl vm.vfs_cache_pressure=$cache_pressure >/dev/null 2>&1
+
+fnc_time_since_last_disk_access() {
+  # Check if the array is started
+  time_since_last_disk_access_sec=9999
+  if [ -d /mnt/disk1 ]
+  then
+    # rdevLastIO will be non-zero if a disk is spinning, it will be the timestamp of last IO (in seconds since epoch)
+    last=$(/root/mdcmd status | grep -a rdevLastIO | grep -v '=0')
+    time_since_last_disk_access_sec=$(echo $last | awk '{t=systime(); gsub("rdevLastIO..=",""); for(i = 1; i <= NF; i++) a[++y]=$i}END{c=asort(a); if (NF > 0) print t-a[NF]; else print 9999; }')
+    # Code to log all disk ages
+      # ages=$(echo $last | awk '{ t=systime(); for(i = 1; i <= NF; i++){ match($i, /rdevLastIO.([0-9]+)/, capgroups); gsub("rdevLastIO..=","", $i);  print capgroups[1] "=" t-$i } }') #print "diskage" i "=" t-$i
+      # log "Ages: $ages"
+  fi
+}
+
+do_deep_scan() {
+  depth_num=$1
+  scan_timout=$2
+  depth_arg="" 
+  [ "$depth_num" -ne 9999 ] && depth_arg="-maxdepth $depth_num"
+  scanned_depth_msg+=" depth $depth_num"
+  search_timeout=0
+  scan_start=`date +%s%N`
+  share_disks_scanned_cnt=0
+  while read share_dir
+  do
+     for i in /mnt/disk* /mnt/cache $user_share_dir
+     do
+        # If the directory does not exist on this disk, don't do recursive "directory scan"
+        [ ! -d "$i"/"$share_dir" ] && continue
+        # if lockfile removed, then don't do new finds
+        [ ! -f "$lockfile" ] && continue
+        (( search_timeout )) && continue
+
+        current_time=`date +%s%N`
+        # +1 to timeout because this is an integer computation
+        remaining_time=$(( ((scan_timout+1)*NANO_PR_SEC-(current_time-scan_start) ) / NANO_PR_SEC ))
+        timepassed=$(( (current_time-scan_start) / NANO_PR_SEC ))
+  # alex cleanup
+       # log "`date "+%M:%S"` $remaining_time for $i/$share_dir - $timepassed - depth $1"
+        # Perform a recursive "find" on /mnt/disk??/share, or /mnt/user/share, or /mnt/cache/share
+        if (( remaining_time > 0 )); then
+          ((share_disks_scanned_cnt++))
+          if [ -f /bin/timeout ]; then
+            # Stop scan after n seconds. Should actually decrease wait-duration based on previous shares scan-time
+            /bin/timeout $remaining_time $command "$i"/"$share_dir" $args $depth_arg >/dev/null 2>&1
+          else
+            $command "$i"/"$share_dir" $args $depth_arg >/dev/null 2>&1
+          fi
+        else
+          search_timeout=1
+          scanned_depth_msg+="(timeout)"
+        fi
+        if [ $? -ne 0 ]; then
+          search_timeout=1
+          scanned_depth_msg+="(timeout)"
+        fi
+        verbose_echo "$start_time_txt Executing $command $i/$share_dir $args $depth_arg"
+     done
+  done < <(echo "$dir_list")
+  # alex cleanup
+  # current_time=`date +%s%N`
+  # remaining_time=$(( (scan_timout*NANO_PR_SEC-(current_time-scan_start) ) / NANO_PR_SEC ))
+  # timepassed=$(( (current_time-scan_start) / NANO_PR_SEC ))
+  # log "`date "+%M:%S"` $scan_timout - $timepassed - $remaining_time - depth $1" 
+}
+
+build_dir_list() {
+  # build a list of directories to cache.  
+  #   If no "-i" options are given, this will be all the top level directories in /mnt/disk* and /mnt/cache
+  #   If "-i" entries are given, they will be the only top level dirs cached.
+  #   If "-e" (exclude) directories are given, they are then deleted from the list by the comm -23 coommand.
+  if [ $include_array_count -gt 0 ]
+  then
+    top_dirs=`(
+     # Include designated directories 
+     a=0
+     while test $a -lt $include_array_count
+     do
+       included_excl=$(find /mnt/disk* /mnt/cache -type d -maxdepth 1 -mindepth 1 -name "${include_array[$a]}" -exec basename {} \; 2>/dev/null)
+       echo "$included_excl" | sort -u
+       a=$(($a+1))
+     done
+    )| sort -u`
+  else
+    top_dirs=`find /mnt/disk* /mnt/cache -type d -maxdepth 1 -mindepth 1  -exec basename {} \; 2>/dev/null|sort -u`
+  fi
+  exclude_dirs=`(
+     # Exclude designated directories from being processed
+     a=0
+     while test $a -lt $exclude_array_count
+     do
+       expanded_excl=$(find /mnt/disk* /mnt/cache -type d -maxdepth 1 -mindepth 1 -name "${exclude_array[$a]}" -exec basename {} \; 2>/dev/null)
+       echo "$expanded_excl" | sort -u
+       a=$(($a+1))
+     done
+    )| sort -u`
+   scan_dirs=`comm -23 <(echo "$top_dirs") <(echo "$exclude_dirs")`
+   echo "$scan_dirs"
+}
+
+# build a command string for "at" to start later if not on-line and -w option used
+at_command=`(
+echo -n $program_dir/$program_name -w -m $min_seconds -M $max_seconds -d $maxdepth -p $cache_pressure -U $ulimit_mem
+[ $command != "find" ] && echo -n " -c \"$command\""
+ a=0
+ while test $a -lt $exclude_array_count
+ do
+   echo -n " -e \"${exclude_array[$a]}"\"
+   a=$(($a+1))
+ done
+ a=0
+ while test $a -lt $include_array_count
+ do
+   echo -n " -i \"${include_array[$a]}"\"
+   a=$(($a+1))
+ done
+ [ $force_disk_busy_flag = "yes" ] && echo -n " -b"
+ [ $suspend_during_mover = "no" ] && echo -n " -S"
+ [ $concise_log = "yes" ] && echo -n " -z"
+ [ $short_log = "yes" ] && echo -n " -s"
+ [ "$user_share_dir" != "" ] && echo -n " -u"
+ [ "$args" != "" ] && echo -n " -a \"$args\""
+ echo
+)`
+
+num_dirs=`find /mnt/disk[1-9]* /mnt/cache -type d -maxdepth 0 -print 2>/dev/null|wc -l`
+if [ $num_dirs -eq 0 ]
+then
+  # Wait for the array to come online
+  if [ "$wait_flag" = "yes"  -a "$background" = "yes" ]
+  then
+    echo $at_command " 1>/dev/null 2>&1" | at now + 1 minute
+    [ -f /dev/tty ] && echo "The unRAID array is not online.  Directory scan will occur when array comes online." >/dev/tty
+    exit 0
+  else
+    if [ "$wait_flag" = "yes" ]
+    then
+      echo "-F and -w may not be used at the same time. Directory scan by $program_name not started." >&2
+    else
+      echo "The unRAID array is not online.  Directory scan by $program_name not started." >&2
+    fi
+    exit 2
+  fi
+fi
+
+dir_list=`build_dir_list`
+
+if [ $short_log = "no" ]
+then
+  log_list="$dir_list"
+else
+  log_list=$(echo "$dir_list" | wc -l)
+  log_list=$(echo $log_list " directories cached")
+fi
+
+if [ "$concise_log" = "no" ]
+then
+echo "==============================================
+command-args=$commandargs
+vfs_cache_pressure=$cache_pressure
+max_seconds=$max_seconds, min_seconds=$min_seconds
+max_depth=$maxdepth
+command=$command $args
+version=$version
+---------- caching directories ---------------
+$log_list
+----------------------------------------------" | logger -t$program_name 
+else
+echo "command args=$commandargs, version=$version, vfs_cache_pressure=$cache_pressure,
+max_seconds=$max_seconds, min_seconds=$min_seconds, max_depth=$maxdepth, command=$command $args
+$log_list" | paste -s -d "," - | logger -t$program_name
+fi
+
+# Create a child process with a "current working directory" on each of the disks
+# These will prevent their un-mounting, and they will prevent an unexpected surprise
+# of "unformatted" disks showing in the management web-page when some disks are un-mounted
+# and other disks are not able to be un-mounted, because they were "busy"  
+# This guarantees that all the disks will be "busy" until the lockfile is removed
+# or these child processes are terminated. No disk may then be un-mounted until these
+# processes terminate.  They will all self-terminate if the lockfile is removed.
+if [ "$force_disk_busy_flag" = "yes" ]
+then
+a=0
+for i in /mnt/disk*  /mnt/cache
+do
+  [ ! -d $i ] && continue
+  ( trap "kill -0 `cat $lockfile` && kill `cat $lockfile`; rm $lockfile" 15; cd $i; while test -f "$lockfile" && kill -0 `cat $lockfile` 2>/dev/null; do sleep 2; done ) &
+  bg_process[$a]=$!
+  a=$(($a+1))
+done
+fi
+
+a=0
+while test $a -lt $exclude_array_count
+do
+  list=`eval ls /mnt/disk*/"${exclude_array[$a]}" /mnt/cache/"${exclude_array[$a]}" 2>/dev/null`
+  if [ "$list" = "" ]
+  then
+     echo "ERROR: excluded directory \"${exclude_array[$a]}\" does not exist." >&2
+     echo "ERROR: excluded directory \"${exclude_array[$a]}\" does not exist." | logger -t$program_name
+  fi
+  a=$(($a+1))
+done
+a=0
+while test $a -lt $include_array_count
+do
+  list=`eval ls /mnt/disk*/"${include_array[$a]}" /mnt/cache/"${include_array[$a]}" 2>/dev/null`
+  if [ "$list" = "" ]
+  then
+     echo "ERROR: included directory \"${include_array[$a]}\" does not exist." >&2
+     echo "ERROR: included directory \"${include_array[$a]}\" does not exist." | logger -t$program_name
+  fi
+  a=$(($a+1))
+done
+
+# Internal vars
+depth_success_idle_incr_counter=0
+depth_success_busy_incr_counter=0
+depth_failure_incr_counter=0
+applieddepth=0
+appliedmaxdepth=$maxdepth
+scheduled_next_depth_increment=0
+is_initial_depth_attempt=1
+
+while [ -f "$lockfile" ]
+do
+  search_timeout=0
+  if [ "$suspend_during_mover"="yes" ]; then
+    if [ -f /var/run/mover.pid ]; then
+      if ps h `cat /var/run/mover.pid` | grep mover >/dev/null 2>&1 ; then
+        # Alex added log line
+         log "Suspended during moving, now sleeping 10 seconds"
+         sleep 10
+         continue
+      fi
+    fi
+  fi
+
+  num_dirs=`find /mnt/disk[1-9]* /mnt/cache -type d -maxdepth 0 -print 2>/dev/null|wc -l`
+  if [ "$num_dirs" -eq 0 ]
+  then
+        # Alex added log line
+    log "Suspended because array is not started, now sleeping 10 seconds" 
+    # array is not started, sleep and look again in 10 seconds.
+    sleep 10
+    continue
+  fi
+
+  start_time=`date +%s%N`
+  start_time_txt=`date "+%Y.%m.%d %H:%M:%S"`
+
+  fnc_time_since_last_disk_access
+  disk_idle_before_scan=${time_since_last_disk_access_sec}
+
+  # always cache root dirs on each of the disks
+  for i in /mnt/disk* /mnt/cache $user_share_dir
+  do
+    find $i -maxdepth 1 -noleaf >/dev/null 2>/dev/null 
+  done
+  #find /mnt/user/Movies -type f \( -name *.jpg -o -name *.xml \) -exec cat "{}" >/dev/null \;
+
+  scanned_depth_msg=""
+
+  do_deep_scan $applieddepth $((is_initial_depth_attempt ? 600 : scan_timeout_sec))
+  search_timeout_first=$search_timeout
+  # Rescan at lower depth seems to hurt cache
+  # if ((search_timeout_first && applieddepth > 0 && applieddepth < 9999)) ; then    
+  #   while ((search_timeout)); do
+  #     lastDepthScan=$((applieddepth-1)) 
+  #     do_deep_scan $lastDepthScan $scan_timeout_sec
+  #   done
+  #   search_timeout=$search_timeout_first
+  # fi
+
+  fnc_time_since_last_disk_access
+  disk_idle_after_scan=${time_since_last_disk_access_sec}
+
+  end_time=`date +%s%N`
+
+  # track how long the recursive "directory scan" is taking.  If it starts to take longer it must be
+  # because it has to read more from the physical disk.  If so, adjust the timing to
+  # perform the directory scan more frequently.
+  elapsed_time=$(($end_time-$start_time))
+
+  alen=${#avg[@]}
+  # Move all the counts up one position in the array.
+  for (( i = $(($alen)) ; i > 0 ; i-- ))
+  do
+    [ $i -lt $window_array_length ] && avg[$(($i+1))]=${avg[$i]}
+  done
+  
+  # The newest will always be stored at index 1
+  avg[1]=$elapsed_time
+
+  # get the weighted average of the last $window_array_length loop passes
+  # more recent values count far more than older values.
+  tot_time=0
+  alen=${#avg[@]}
+
+  tot_count=0
+  for (( i = 1; i <= $alen; i++ ))
+  do
+    weight=$(( $alen - $i + 1 ))
+    weight=$(( $weight * 3 ))
+    tot_count=$(( $tot_count + $weight))
+    tot_time=$(( $tot_time + $(( ${avg[$i]} * $weight ))))
+  done
+  avg_elapsed_time=$(($tot_time/$tot_count))
+
+  [ $avg_elapsed_time -eq 0 ] && avg_elapsed_time=$elapsed_time
+
+  [ $avg_elapsed_time -lt $(($elapsed_time+100000)) -a $num_seconds -gt $min_seconds  ] && num_seconds=$(($num_seconds-1))
+  [ $avg_elapsed_time -gt $(($elapsed_time-100000)) -a $num_seconds -lt $max_seconds ] && num_seconds=$(($num_seconds+1))
+
+  # Alex added applieddepth
+  elapsed_secs=$(( $elapsed_time/1000000000 ))
+  
+  if ((is_initial_depth_attempt)); then
+    initial_fullscan_based_max_count=$((3*elapsed_secs / scan_timeout_sec))
+  fi
+
+  log_disk_access_msg=""
+    # Update possibly increment applied depth, and update 'depth' command postfix paramater
+  if ((elapsed_secs < scan_judge_as_failure_sec && ! $search_timeout_first && (disk_idle_after_scan>=elapsed_secs || disk_idle_before_scan==0) )); then 
+      # build cache-pressure by repeating successfull search, and give time for checking for disk-access
+      if ((disk_idle_after_scan>=elapsed_secs)); then
+        log_disk_access_msg=" Idle"
+        ((depth_success_idle_incr_counter++))
+        depth_failure_incr_counter=0
+      else 
+        # disk_idle_before_scan=0
+        ((depth_success_busy_incr_counter++))
+        # don't reset depth_failure_incr_counter because we don't really know if this scan caused disk-access
+      fi
+  else
+    log_disk_access_msg=" Busy"
+    log "Idle (or unknown): $elapsed_secs < $scan_judge_as_failure_sec && ! $search_timeout_first && ($disk_idle_after_scan>=$elapsed_secs || $disk_idle_before_scan==0)"
+    # timeout 
+    ((depth_failure_incr_counter++))
+    depth_success_idle_incr_counter=0
+    depth_success_busy_incr_counter=0
+  fi
+
+  applied_depth_maxscans_with_disc_access=$(())
+  is_initial_depth_attempt=0
+  if ((applieddepth < appliedmaxdepth && (depth_success_idle_incr_counter>=3 || depth_success_busy_incr_counter > 10))); then
+    (( applieddepth++ ))
+    is_initial_depth_attempt=1
+    depth_failure_incr_counter=0
+    depth_success_idle_incr_counter=0
+    depth_success_busy_incr_counter=0
+    # skip straight to 9999 if deep enough, so we can start sleeping
+    (( applieddepth > depth_max_incremental_depth )) && applieddepth=$maxdepth
+  elif ((depth_failure_incr_counter >= scan_judge_as_failure_sec && depth_failure_incr_counter >= initial_fullscan_based_max_count)); then
+    # if unable to avoid disk access for a long time, stop going deeper and go one level up
+    depth_failure_incr_counter=0
+    depth_success_idle_incr_counter=0
+    depth_success_busy_incr_counter=0
+    (( applieddepth == 9999)) && appliedmaxdepth=$depth_max_incremental_depth || appliedmaxdepth=$((applieddepth-1))
+    applieddepth=$appliedmaxdepth
+    is_initial_depth_attempt=1
+    scheduled_next_depth_increment=$((scheduled_next_depth_increment_timer_duration_sec*NANO_PR_SEC+end_time))
+    log "Stopping at/decreasing to depth $appliedmaxdepth because previous scans have accessed disks/taken too long, will retry in $decreased_max_depth_rescan_wait_duration_sec secs"
+    # ALex todo set next retry attempt greater depth, eg current date + 1 week, if less than max depth
+  fi
+
+  # In case of reduced max depth, test if we should reset and try going deeper again
+  if (( appliedmaxdepth < maxdepth && end_time > scheduled_next_depth_increment && scheduled_next_depth_increment > 0)); then
+    log "Starting scheduled depth scan again" 
+    appliedmaxdepth=$maxdepth
+  fi
+
+  # Alex changed logging for applieddepth and no sleep
+  # log duration
+  if [ "$background" = "no" -o "$run_log" != "" ]
+  then
+   a=`awk "BEGIN{ printf \\"%05.2fs, weighted avg=%05.2fs\n\\", ($elapsed_time/1000000000), ($avg_elapsed_time/1000000000) ; }"`
+  fi
+  fnc_time_since_last_disk_access
+  ((applieddepth == appliedmaxdepth)) && next_sleed_duration=$num_seconds || next_sleed_duration=1
+  log "$start_time_txt Executed $command in ${a},$scanned_depth_msg, sleep ${next_sleed_duration}s, Disks idle time before ${disk_idle_before_scan}s, idle after ${disk_idle_after_scan}s, sharesXdisks scanned $share_disks_scanned_cnt${log_disk_access_msg}"
+
+  # Alex: force_disk_busy_flag is unnessary when using unmount-events of unRaid 5 (as this plg-file sets up, unless this script is extracted from plg-file)
+  if [ "$force_disk_busy_flag" = "yes" ]
+  then
+    # if the user attempted to stop the array, terminate this process so it can be stopped next time they try.
+    stop_attempt=`tail -200 /var/log/syslog | egrep "devices still in use|mdcmd.*stop|Retry unmounting"`
+    if [ "$stop_attempt" != "" ] 
+    then
+       for bg_pid in ${bg_process[@]}
+       do
+         kill $bg_pid >/dev/null 2>&1
+       done
+       echo "Suspending $program_name for $suspend_secs seconds to allow for clean shutdown of array" | logger -t$program_name
+       echo "While suspended, pressing \"Stop\" on the unRAID management web-interface will shutdown the array" | logger -t$program_name
+       sleep $suspend_secs
+       echo "  Resuming $program_name" | logger -t$program_name
+       a=0
+       for i in /mnt/disk*  /mnt/cache
+       do
+         [ ! -d $i ] && continue
+         ( cd $i; while test -f "$lockfile"; do sleep 2; done ) &
+         bg_process[$a]=$!
+         a=$(($a+1))
+       done
+    fi
+  fi
+  
+  # If the array is now stopped, terminate cache_dirs and re-invoke later via "at"
+  num_dirs=`find /mnt/disk[1-9]* -type d -maxdepth 0 -print 2>/dev/null|wc -l`
+  if [ "$num_dirs" -eq 0 ]
+  then
+    if [ "$background" = "yes" ]
+    then
+      rm -f $lockfile
+      echo scheduling via at $at_command  | logger -t$program_name
+      echo $at_command " 1>/dev/null 2>&1" | at now + 1 minute
+    fi
+  fi
+
+done &
+
+
+# while loop was put into background, now disown it 
+# so it will continue to run when you log off
+# to get it to stop, type: rm /var/lock/cache_dirs.LCK
+background_pid=$!
+echo $background_pid > "${lockfile}"
+if [ $background = "no" ] 
+then
+  # only way to get here is to remove the lock file or kill the background process shell with the while loop
+  trap "rm -f $lockfile; kill $background_pid 2>/dev/null; exit" INT TERM EXIT
+  wait
+else
+  echo "$program_name process ID $background_pid started, To terminate it, type: $program_name -q" >&2
+  echo "$program_name process ID $background_pid started, To terminate it, type: $program_name -q" | logger -t$program_name 
+  disown %%
+fi
+]]>
+</INLINE>
+</FILE>
+
+
+
+<FILE Name="/var/log/cache_dirs/config.log">
+<INLINE>
+<![CDATA[
+
+]]>
+</INLINE>
+</FILE>
+
+
+<!-- create a default cache_dirs.cfg file -->
+<FILE Name="/boot/config/plugins/cache_dirs/cache_dirs.cfg">
+<INLINE>
+<![CDATA[
+SERVICE="enable"
+WAIT_ARRAY="-w"
+SEC_MIN="1"
+SEC_MAX="10"
+SHORTER_LOG=""
+MAX_DEPTH=""
+FIND_ALT=""
+ARGS=""
+SCAN_USER=""
+EXCLUDE=""
+INCLUDE=""
+DISKS_BUSY=""
+CACHE_PRESSURE=""
+MOVER=""
+CONCISE_LOG=""
+RUNAS=""
+PARAMS=" -w"
+]]>
+</INLINE>
+</FILE>
+
+
+
+
+<!-- create the rc.cache_dirs start/stop script -->
+<FILE Name="/etc/rc.d/rc.cache_dirs" Mode="0770">
+<INLINE>
+<![CDATA[
+#!/bin/bash
+
+start() {
+   cd_params=`grep "PARAMS=" /boot/config/plugins/cache_dirs/cache_dirs.cfg | cut -d= -f2`
+   cd_start=`grep "SERVICE=" /boot/config/plugins/cache_dirs/cache_dirs.cfg | cut -d\" -f2`
+   if [ $cd_start = "enable" ]; then
+     if [ -x /usr/sbin/cache_dirs ]; then
+       echo "/usr/sbin/cache_dirs $cd_params &" > /tmp/cache_dirs_run.sh
+       echo "rm -f /tmp/cache_dirs_run.sh" >> /tmp/cache_dirs_run.sh
+       chmod 777 /tmp/cache_dirs_run.sh
+       /tmp/cache_dirs_run.sh &
+       exit 0
+     fi
+   else
+    echo Service not enabled
+   fi
+}
+
+startDelayed() {
+   cd_params=`grep "PARAMS=" /boot/config/plugins/cache_dirs/cache_dirs.cfg | cut -d= -f2`
+   cd_start=`grep "SERVICE=" /boot/config/plugins/cache_dirs/cache_dirs.cfg | cut -d\" -f2`
+   if [ $cd_start = "enable" ]; then
+     if [ -x /usr/sbin/cache_dirs ]; then
+       echo "/usr/sbin/cache_dirs $cd_params &" > /tmp/cache_dirs_run.sh
+       echo "rm -f /tmp/cache_dirs_run.sh" >> /tmp/cache_dirs_run.sh
+       chmod 777 /tmp/cache_dirs_run.sh
+       echo /tmp/cache_dirs_run.sh " 1>/dev/null 2>&1" | at 6:00
+       exit 0
+     fi
+   else
+    echo Service not enabled
+   fi
+}
+
+stop() {
+   [ -x /usr/sbin/cache_dirs ] &&
+   /usr/sbin/cache_dirs -q
+}
+
+restart() {
+  stop
+  sleep 1
+  start
+}
+
+case $1 in
+'start')
+	start
+;;
+'startDelayed')
+	startDelayed
+;;
+'stop')
+	stop
+;;
+'restart')
+	restart
+;;
+*) echo Possible commands: start, startDelayed, stop, restart
+   ;;
+esac
+]]>
+</INLINE>
+</FILE>
+
+
+
+
+<!-- event handler -->
+<FILE Name="/usr/local/emhttp/plugins/cache_dirs/event/disks_mounted" Mode="0770">
+<INLINE>
+<![CDATA[
+#!/bin/bash
+/etc/rc.d/rc.cache_dirs startDelayed
+]]>
+</INLINE>
+</FILE>
+
+
+
+
+<!-- event handler -->
+<FILE Name="/usr/local/emhttp/plugins/cache_dirs/event/unmounting_disks" Mode="0770">
+<INLINE>
+<![CDATA[
+/etc/rc.d/rc.cache_dirs stop
+]]>
+</INLINE>
+</FILE>
+
+
+
+
+<!-- Create cache_dirs.php file in the /etc/local/emhttp/plugins/cache_dirs folder -->
+<FILE Name="/usr/local/emhttp/plugins/cache_dirs/cache_dirs.php">
+<INLINE>
+<![CDATA[
+<?PHP
+$cache_dirs_cfg = parse_ini_file( "/boot/config/plugins/cache_dirs/cache_dirs.cfg");
+$cache_dirs_running = file_exists( "/var/lock/cache_dirs.LCK") ? "yes" : "no";
+?>
+   <form name="cache_dirs_settings" method="POST" action="/plugins/cache_dirs/cache_dirs_ctl.php" target="progressFrame">
+      <input type="hidden" name="cmd" value="apply">
+      <table class="settings">
+         <tr>
+         <td>Enable Cache Dirs Service:</td>
+         <td><select name="SERVICE" size="1" onChange="checkRUNNING(this.form);">
+            <?=mk_option($cache_dirs_cfg['SERVICE'], "disable", "No");?>
+            <?=mk_option($cache_dirs_cfg['SERVICE'], "enable", "Yes");?>
+            </select>(Default=Yes)</td>
+         </tr>
+
+         <tr>
+         <td>Wait for Array to go online:</td>
+         <td><select id="WAIT_ARRAY_ID" name="WAIT_ARRAY_VALUE" size="1" onChange="checkRUNNING(this.form);">
+            <?=mk_option($cache_dirs_cfg['WAIT_ARRAY'], "", "No");?>
+            <?=mk_option($cache_dirs_cfg['WAIT_ARRAY'], "-w", "Yes");?>
+            </select>(Default=No)
+			<input name="WAIT_ARRAY" type="hidden" value=""></td>
+         </tr>
+
+         <tr>
+         <td>Minimum seconds between scans:</td>
+         <td><input type="text" name="SEC_MIN_VALUE" value="<?=$cache_dirs_cfg['SEC_MIN'];?>" onChange="checkRUNNING(this.form);">(Default=1)
+		 <input name="SEC_MIN" type="hidden" value="<?=$cache_dirs_cfg['SEC_MIN'];?>"></td>
+         </tr>
+
+         <tr>
+         <td>Maximum seconds between scans:</td>
+         <td><input type="text" name="SEC_MAX_VALUE" value="<?=$cache_dirs_cfg['SEC_MAX'];?>" onChange="checkRUNNING(this.form);">(Default=10)
+		 <input name="SEC_MAX" type="hidden" value="<?=$cache_dirs_cfg['SEC_MAX'];?>"></td>
+         </tr>
+
+         <tr>
+         <td>Shorter Log:</td>
+         <td><select id="SHORTER_LOG_ID" name="SHORTER_LOG_VALUE" size="1" onChange="checkRUNNING(this.form);">
+            <?=mk_option($cache_dirs_cfg['SHORTER_LOG'], "", "No");?>
+            <?=mk_option($cache_dirs_cfg['SHORTER_LOG'], "-s", "Yes");?>
+            </select>(Default=No)
+			<input name="SHORTER_LOG" type="hidden" value=""></td>
+         </tr>
+
+         <tr>
+         <td>Maximum Scan Depth:</td>
+         <td><input type="text" name="MAX_DEPTH_VALUE" value="<?=$cache_dirs_cfg['MAX_DEPTH'];?>" onChange="checkRUNNING(this.form);">(Default=Blank)
+		 <input name="MAX_DEPTH" type="hidden" value="<?=$cache_dirs_cfg['MAX_DEPTH'];?>"></td>
+         </tr>
+     
+         <tr>
+         <td>use command instead of 'find':</td>
+         <td><input type="text" name="FIND_ALT_VALUE" value="<?=$cache_dirs_cfg['FIND_ALT'];?>" onChange="checkRUNNING(this.form);">(Default=Blank)
+		 <input name="FIND_ALT" type="hidden" value="<?=$cache_dirs_cfg['FIND_ALT'];?>"></td>
+         </tr>
+
+         <tr>
+         <td>Arguments to use with above command:</td>
+         <td><input type="text" name="ARGS_VALUE" value="<?=$cache_dirs_cfg['ARGS'];?>" onChange="checkRUNNING(this.form);">(Default=Blank)
+		 <input name="ARGS" type="hidden" value="<?=$cache_dirs_cfg['ARGS'];?>"></td>
+         </tr>
+
+         <tr>
+         <td>Also scan /mnt/user:</td>
+         <td><select id="SCAN_USER_ID" name="SCAN_USER_VALUE" size="1" onChange="checkRUNNING(this.form);">
+            <?=mk_option($cache_dirs_cfg['SCAN_USER'], "", "No");?>
+            <?=mk_option($cache_dirs_cfg['SCAN_USER'], "-u", "Yes");?>
+            </select>(Default=No)
+			<input name="SCAN_USER" type="hidden" value=""></td>
+         </tr>
+
+         <tr>
+         <td>Exclude Directories:</td>
+         <td><input type="text" name="EXCLUDE_VALUE" value="<?=$cache_dirs_cfg['EXCLUDE'];?>" onChange="checkRUNNING(this.form);">(Seperate each with a comma, Default=Blank)
+		 <input name="EXCLUDE" type="hidden" value="<?=$cache_dirs_cfg['EXCLUDE'];?>"></td>
+         </tr>
+
+         <tr>
+         <td>Include Directories:</td>
+         <td><input type="text" name="INCLUDE_VALUE" value="<?=$cache_dirs_cfg['INCLUDE'];?>" onChange="checkRUNNING(this.form);">(Seperate each with a comma, Default=Blank)
+		 <input name="INCLUDE" type="hidden" value="<?=$cache_dirs_cfg['INCLUDE'];?>"></td>
+         </tr>
+		 
+         <tr>
+         <td>Do force disks busy:</td>
+         <td><select id="DISKS_BUSY_ID" name="DISKS_BUSY_VALUE" size="1" onChange="checkRUNNING(this.form);" onChange="checkRUNNING(this.form);">
+            <?=mk_option($cache_dirs_cfg['DISKS_BUSY'], "", "No");?>
+            <?=mk_option($cache_dirs_cfg['DISKS_BUSY'], "-b", "Yes");?>
+            </select>(Default=No)
+			<input name="DISKS_BUSY" type="hidden" value=""></td>
+         </tr>
+
+         <tr>
+         <td>Cache Pressure:</td>
+         <td><input type="text" name="CACHE_PRESSURE_VALUE" value="<?=$cache_dirs_cfg['CACHE_PRESSURE'];?>" onChange="checkRUNNING(this.form);">(Default=10)
+		 <input name="CACHE_PRESSURE" type="hidden" value="<?=$cache_dirs_cfg['CACHE_PRESSURE'];?>"></td>
+         </tr>
+
+         <tr>
+         <td>Suspend scan during 'mover' process:</td>
+         <td><select id="MOVER_ID" name="MOVER_VALUE" size="1" onChange="checkRUNNING(this.form);">
+            <?=mk_option($cache_dirs_cfg['MOVER'], "-S", "No");?>
+            <?=mk_option($cache_dirs_cfg['MOVER'], "", "Yes");?>
+            </select>(Default=Yes)
+			<input name="MOVER" type="hidden" value=""></td>
+         </tr>
+
+         <tr>
+         <td>Concise Logs:</td>
+         <td><select id="CONCISE_LOG_ID" name="CONCISE_LOG_VALUE" size="1" onChange="checkRUNNING(this.form);">
+            <?=mk_option($cache_dirs_cfg['CONCISE_LOG'], "", "No");?>
+            <?=mk_option($cache_dirs_cfg['CONCISE_LOG'], "-z", "Yes");?>
+            </select>(Default=No)
+			<input name="CONCISE_LOG" type="hidden" value=""></td>
+         </tr>
+
+         <tr>
+         <td></td>
+         <td><input type="submit" name="runCmd" value="Apply"><button type="button" onClick="done();">Done</button></td>
+         </tr>
+      </table>
+   </form>
+   
+   <div id="title"><span class="left">Status: 
+   
+   <? if ($cache_dirs_running=="yes") { ?>
+
+     <span style="color:green" class="green">Running</span>
+
+   <? } else { ?>
+   
+      <span style="color:red" class="red">Stopped</span>
+   
+   <?php } ?>
+   </span></div>
+
+ <table class="settings">
+         <tr>
+         <td>Cache_Dirs Version:</td>
+         <td><?php echo exec('/usr/sbin/cache_dirs -V | grep "cache_dirs version:" | cut -d: -f2'); ?></td>
+         </tr>
+         <tr>
+         <td>Configuration Location:</td>
+         <td>/boot/config/plugins/cache_dirs/cache_dirs.cfg</td>
+         </tr>
+</table>
+
+<script type="text/javascript">
+	function checkRUNNING(form)
+	{
+		form.WAIT_ARRAY.value = form.WAIT_ARRAY_VALUE.options[form.WAIT_ARRAY_VALUE.selectedIndex].value;
+		form.SEC_MIN.value = (form.SEC_MIN_VALUE.value);
+		form.SEC_MAX.value = (form.SEC_MAX_VALUE.value);
+		form.SHORTER_LOG.value = form.SHORTER_LOG_VALUE.options[form.SHORTER_LOG_VALUE.selectedIndex].value;
+		form.MAX_DEPTH.value = (form.MAX_DEPTH_VALUE.value);
+		form.FIND_ALT.value = (form.FIND_ALT_VALUE.value);
+		form.ARGS.value = (form.ARGS_VALUE.value);
+		form.SCAN_USER.value = form.SCAN_USER_VALUE.options[form.SCAN_USER_VALUE.selectedIndex].value;
+		form.EXCLUDE.value = (form.EXCLUDE_VALUE.value);
+		form.INCLUDE.value = (form.INCLUDE_VALUE.value);
+		form.DISKS_BUSY.value = form.DISKS_BUSY_VALUE.options[form.DISKS_BUSY_VALUE.selectedIndex].value;
+		form.CACHE_PRESSURE.value = (form.CACHE_PRESSURE_VALUE.value);
+		form.MOVER.value = form.MOVER_VALUE.options[form.MOVER_VALUE.selectedIndex].value;
+		form.CONCISE_LOG.value = form.CONCISE_LOG_VALUE.options[form.CONCISE_LOG_VALUE.selectedIndex].value;
+		
+		if ("<?=$cache_dirs_running;?>"=="yes")
+		{
+			form.WAIT_ARRAY_VALUE.disabled = true;
+			form.SEC_MIN_VALUE.disabled = true;
+			form.SEC_MAX_VALUE.disabled = true;
+			form.SHORTER_LOG_VALUE.disabled = true;
+			form.MAX_DEPTH_VALUE.disabled = true;
+			form.FIND_ALT_VALUE.disabled = true;
+			form.ARGS_VALUE.disabled = true;
+			form.SCAN_USER_VALUE.disabled = true;
+			form.EXCLUDE_VALUE.disabled = true;
+			form.INCLUDE_VALUE.disabled = true;
+			form.DISKS_BUSY_VALUE.disabled = true;
+			form.CACHE_PRESSURE_VALUE.disabled = true;
+			form.MOVER_VALUE.disabled = true;
+			form.CONCISE_LOG_VALUE.disabled = true;
+		}
+		else
+		{
+			form.WAIT_ARRAY_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.SEC_MIN_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.SEC_MAX_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.SHORTER_LOG_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.MAX_DEPTH_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.FIND_ALT_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.ARGS_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.SCAN_USER_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.EXCLUDE_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.INCLUDE_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.DISKS_BUSY_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.CACHE_PRESSURE_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.MOVER_VALUE.disabled = (form.SERVICE.value == "enable");
+			form.CONCISE_LOG_VALUE.disabled = (form.SERVICE.value == "enable");
+		}
+	}
+	checkRUNNING(document.cache_dirs_settings);
+</script>
+]]>
+</INLINE>
+</FILE>
+
+
+
+
+<!-- create cache_dirs_ctl.php -->
+<FILE Name="/usr/local/emhttp/plugins/cache_dirs/cache_dirs_ctl.php">
+<INLINE>
+<![CDATA[
+<?PHP
+  $logfile = "/var/log/cache_dirs/config.log";
+  $configfile = "/boot/config/plugins/cache_dirs/cache_dirs.cfg";
+  $configfileparam = "/boot/config/plugins/cache_dirs/cache_dirs_params.sh";
+  
+  if (empty($_SERVER['SHELL']))
+    $newline = "<br>";
+  else
+    $newline = "\n";
+
+  $cur_dt = date("F j\, Y h:i:s A");
+  write_log("\nStart: $cur_dt");
+  
+  $settings = array(
+    "SERVICE",
+    "WAIT_ARRAY",
+	"SEC_MIN",
+	"SEC_MAX",
+	"SHORTER_LOG",
+	"MAX_DEPTH",
+	"FIND_ALT",
+	"ARGS",
+	"SCAN_USER",
+	"EXCLUDE",
+	"INCLUDE",
+	"DISKS_BUSY",
+	"MOVER",
+	"CACHE_PRESSURE",
+	"CONCISE_LOG",
+    "RUNAS",
+  );
+
+  parse_str($argv[1],$_POST);
+
+  $SERVICE=$_POST['SERVICE'];
+
+  $WAIT_ARRAY=$_POST['WAIT_ARRAY'];
+  $SEC_MIN=$_POST['SEC_MIN'];
+  $SEC_MAX=$_POST['SEC_MAX'];
+  $SHORTER_LOG=$_POST['SHORTER_LOG'];
+  $MAX_DEPTH=$_POST['MAX_DEPTH'];
+  $FIND_ALT=$_POST['FIND_ALT'];
+  $ARGS=$_POST['ARGS'];
+  $SCAN_USER=$_POST['SCAN_USER'];
+  $EXCLUDE=$_POST['EXCLUDE'];
+  $INCLUDE=$_POST['INCLUDE'];
+  $DISKS_BUSY=$_POST['DISKS_BUSY'];
+  $CACHE_PRESSURE=$_POST['CACHE_PRESSURE'];
+  $MOVER=$_POST['MOVER'];
+  $CONCISE_LOG=$_POST['CONCISE_LOG'];
+  
+  $RUNAS=$_POST['RUNAS'];
+
+  write_log("SERVICE: $SERVICE\nWAIT_ARRAY: $WAIT_ARRAY\nSEC_MIN: $SEC_MIN\nSEC_MAX: $SEC_MAX\nSHORTER_LOG: $SHORTER_LOG\nMAX_DEPTH: $MAX_DEPTH\nFIND_ALT: $FIND_ALT\nARGS: $ARGS\nSCAN_USER: $SCAN_USER\nEXCLUDE: $EXCLUDE\nINCLUDE: $INCLUDE\nDISKS_BUSY: $DISKS_BUSY\nCACHE_PRESSURE: $CACHE_PRESSURE\nMOVER: $MOVER\nCONCISE_LOG: $CONCISE_LOG\nRUNAS: $RUNAS");
+
+  switch ($_POST['cmd']) {
+    case 'apply':
+      saveconfig();
+      
+      if ($SERVICE == "enable") {
+        stopcachedirs();
+		    startcachedirs();
+      }
+      else
+        stopcachedirs();
+      
+      break;
+     case 'start':
+      break;
+    case 'stop':
+      break;
+    case 'enable':
+      break;
+    case 'disable':
+      break;
+    default:
+    break;
+  }
+
+  if (empty($_SERVER['SHELL'])) {
+    echo("<html>");
+    echo("<head><script>var goback=parent.location;</script></head>");
+    echo("<body onLoad=\"parent.location=goback;\"></body>");
+    echo("</html>");
+  }
+  
+  $cur_dt = date("F j\, Y h:i:s A");
+  write_log("\nEnd: $cur_dt");
+  
+  function startcachedirs() {
+    global $newline, $log;
+
+    echo("Starting Cache Dirs...");
+    system("nohup /etc/rc.d/rc.cache_dirs start > /dev/null & echo $!;");
+	//exec_log("/etc/rc.d/rc.cache_dirs start");
+
+    echo("Completed$newline");
+
+  }
+  
+  function stopcachedirs() {
+    global $newline, $log;
+
+    echo("Stopping Cache Dirs...");
+    exec_log("/etc/rc.d/rc.cache_dirs stop");
+    for ($lilloop; $lilloop<=5; $lilloop++)
+	{
+	  sleep(1);
+      echo(".");
+    }
+    echo("Completed$newline");
+  }
+  
+  
+  function saveconfig () {
+    echo("Saving Settings...");
+    global $_POST, $configfile, $settings, $newline, $SERVICE, $RUNAS, $WAIT_ARRAY, $SEC_MIN, $SEC_MAX, $SHORTER_LOG, $MAX_DEPTH, $FIND_ALT, $ARGS, $SCAN_USER, $EXCLUDE, $INCLUDE, $DISKS_BUSY, $MOVER, $CONCISE_LOG;
+
+	
+    $string .= "";
+
+    foreach ($_POST as $key=>$value) {
+      if (in_array($key, $settings)) {
+        $string .= "$key=\"$value\"\n";
+      }
+    }
+	
+	$string .= "PARAMS=";
+	if ($WAIT_ARRAY != "") { $string .= " ".$WAIT_ARRAY; }
+	if (($SEC_MIN != "") && ($SEC_MIN != "1")) { $string .= " -m ".$SEC_MIN; }
+	if (($SEC_MAX != "") && ($SEC_MAX != "10")) { $string .= " -M ".$SEC_MAX; }
+	if ($SHORTER_LOG != "") { $string .= " ".$SHORTER_LOG; }
+	if ($MAX_DEPTH != "") { $string .= " -d ".$MAX_DEPTH; }
+	
+	if ($FIND_ALT != "") {
+    	$string .= " -c ".$FIND_ALT;
+        if ($ARGS != "") {
+        	$string .= " -a ".$ARGS;
+		}
+	}
+	if ($CACHE_PRESSURE != "" ) { $string .= " -p ".$CACHE_PRESSURE; }
+	
+	if ($SCAN_USER != "") { $string .= " ".$SCAN_USER; }
+
+    if ($EXCLUDE != "") { 
+        $list = explode(',', $EXCLUDE);
+        foreach ($list as $insert) {
+		    $string .= " -e \"".$insert."\"";
+		}
+	}
+    if ($INCLUDE != "") { 
+        $list = explode(',', $INCLUDE);
+        foreach ($list as $insert) {
+		    $string .= " -i \"".$insert."\"";
+		}
+	}
+
+	if ($DISKS_BUSY != "") { $string .= " ".$DISKS_BUSY; }
+	if ($MOVER != "") { $string .= " ".$MOVER; }
+	if ($CONCISE_LOG != "") { $string .= " ".$CONCISE_LOG; }
+	$string .= "\n";
+    
+    write_string($configfile, $string, TRUE);
+    
+    write_log($results);
+
+    echo("Completed$newline ");
+  }
+  
+  function exec_log($cmd) {
+
+    $results = exec($cmd);
+    
+    $results = "\nCMD: $cmd \nResults: $results";
+    write_log($results);
+  }
+
+  function write_log($contents) {
+    global $logfile;
+    write_string($logfile, "$contents\n", FALSE);
+  }
+    
+  function write_string ($file, $contents, $overwrite) {
+    if (file_exists($file)) {
+      if ($overwrite)
+          unlink($file);
+          touch($file);
+    }
+    else {
+      touch($file);
+    }
+    
+    $fp = @fopen($file, 'a');
+    @flock($fp, LOCK_EX);
+    @fwrite($fp, $contents);
+    @flock($fp, LOCK_UN);
+    @fclose($fp);
+  }
+  
+?>
+]]>
+</INLINE>
+</FILE>
+
+
+
+
+<!-- create cache_dirs.page file -->
+<FILE Name="/usr/local/emhttp/plugins/cache_dirs/cache_dirs.page">
+<INLINE>
+<![CDATA[
+Author="John Revill"
+Version="1.6.7-4jr"
+Menu="OtherSettings"
+Title="Cache Directories"
+Type="php"
+Icon="cache_dirs.png"
+]]>
+</INLINE>
+</FILE>
+
+
+<!-- Download the icon if not available -->
+<FILE Name="/boot/config/plugins/cache_dirs/cache_dirs.png">
+<URL>http://dl.dropbox.com/u/73389880/cache_dirs-files/cache_dirs.png</URL>
+</FILE>
+
+<FILE Name="/usr/local/emhttp/plugins/cache_dirs/cache_dirs.png">
+<LOCAL>/boot/config/plugins/cache_dirs/cache_dirs.png</LOCAL>
+</FILE>
+
+</PLUGIN>
