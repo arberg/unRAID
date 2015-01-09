@@ -736,6 +736,7 @@ do
       fi
   else
     log_disk_access_msg=" Busy"
+    # Alex clean up (bug here? hence the log)
     log "Idle (or unknown): $elapsed_secs < $scan_judge_as_failure_sec && ! $search_timeout_first && ($disk_idle_after_scan>=$elapsed_secs || $disk_idle_before_scan==0)"
     # timeout 
     ((depth_failure_incr_counter++))
