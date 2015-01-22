@@ -123,9 +123,10 @@ fi
 #                 Setting ulimit to zero ( with "-U 0" option) is now special, cache_dirs will not set any ulimit at all.  You'll inherit the system value, whatever it might be.
 # Joe L.
 #
-# Version 2.0.0   Added gradual depth to avoid continous scans of filesystem, monitor of disk-idle, and better user-feedback as to disk spin-up in log-file.
+# Version 2.0.0 - Added gradual depth to avoid continous scans of filesystem, monitor of disk-idle, and better user-feedback as to disk spin-up in log-file.
 #                 Now stops cache_dirs immediately on stop signal (eg array stop) including stopping the currently running find-process.
 #                 Force-disk-busy now defaults no and inverted flag (and changed -B to -b) because it was (mostly) unRaid 4 and its unnessary when using plg with unmount disk event.
+# Version 2.0.1 - Fixed missing sleep. Now decreases scan-depth after few seconds (20-40s) if cache is lost after many successful cache-hits, because we don't want cache_dirs to be a resource-hog when system is otherwise occupied.
 # arberg
 ####################################################################################
 version=2.0.0
@@ -189,7 +190,8 @@ args="-noleaf"
 concise_log="no"
 run_log="/var/log/cache_dirs.log"
 debug_output=0
-scan_timeout_sec=600
+scan_timeout_sec_initial=600
+scan_timeout_sec_next=600
 scan_judge_as_failure_sec=10
 ##7 seems sane without timeout or with large scan_timeout_sec
 depth_maxscans_with_disc_access=7
@@ -450,11 +452,11 @@ do_deep_scan() {
           fi
         else
           search_timeout=1
-          scanned_depth_msg+="(timeout)"
+          scanned_depth_msg+="(timeout ${scan_timout}s)"
         fi
         if [ $? -ne 0 ]; then
           search_timeout=1
-          scanned_depth_msg+="(timeout)"
+          scanned_depth_msg+="(timeout ${scan_timout}s)"
         fi
         verbose_echo "$start_time_txt Executing $command $i/$share_dir $args $depth_arg"
      done
@@ -623,6 +625,7 @@ applieddepth=0
 appliedmaxdepth=$maxdepth
 scheduled_next_depth_increment=0
 is_initial_depth_attempt=1
+scan_timeout_sec=scan_timeout_sec_next
 
 while [ -f "$lockfile" ]
 do
@@ -663,7 +666,7 @@ do
 
   scanned_depth_msg=""
 
-  do_deep_scan $applieddepth $((is_initial_depth_attempt ? 600 : scan_timeout_sec))
+  do_deep_scan $applieddepth $((is_initial_depth_attempt ? scan_timeout_sec_initial : scan_timeout_sec))
   search_timeout_first=$search_timeout
   # Rescan at lower depth seems to hurt cache
   # if ((search_timeout_first && applieddepth > 0 && applieddepth < 9999)) ; then    
@@ -718,7 +721,13 @@ do
   elapsed_secs=$(( $elapsed_time/1000000000 ))
   
   if ((is_initial_depth_attempt)); then
-    initial_fullscan_based_max_count=$((3*elapsed_secs / scan_timeout_sec))
+  	if ((elapsed_secs > scan_timeout_sec)); then
+	  	# Set number of disk-access-scans. This is irrelevant if we don't use the timeout, ie if scan_timeout_sec_initial=scan_timeout_sec, in that case we should just have static count
+	    max_no_disk_access_scans=$(( 3 *elapsed_secs / scan_timeout_sec))
+	else 
+		# max allowed scans with disk-access if we don't apply the timeout of the scan (because subsequent scans are expected to be faster than scan_timeout_sec).
+		max_no_disk_access_scans=3
+	fi
   fi
 
   log_disk_access_msg=""
@@ -729,6 +738,11 @@ do
         log_disk_access_msg=" Idle"
         ((depth_success_idle_incr_counter++))
         depth_failure_incr_counter=0
+        if ((depth_success_idle_incr_counter>100 && applieddepth == appliedmaxdepth)); then
+        	# We found a good depth. Don't permit many scans exceeding time limit, because it means disks are otherwise occupied, and cache_dirs should not be a resource-hog
+   			max_no_disk_access_scans=2
+   			scan_timeout_sec=$((avg_elapsed_time>0 ? avg_elapsed_time*10 : 10))
+        fi
       else 
         # disk_idle_before_scan=0
         ((depth_success_busy_incr_counter++))
@@ -744,7 +758,6 @@ do
     depth_success_busy_incr_counter=0
   fi
 
-  applied_depth_maxscans_with_disc_access=$(())
   is_initial_depth_attempt=0
   if ((applieddepth < appliedmaxdepth && (depth_success_idle_incr_counter>=3 || depth_success_busy_incr_counter > 10))); then
     (( applieddepth++ ))
@@ -754,17 +767,19 @@ do
     depth_success_busy_incr_counter=0
     # skip straight to 9999 if deep enough, so we can start sleeping
     (( applieddepth > depth_max_incremental_depth )) && applieddepth=$maxdepth
-  elif ((depth_failure_incr_counter >= scan_judge_as_failure_sec && depth_failure_incr_counter >= initial_fullscan_based_max_count)); then
+  elif ((depth_failure_incr_counter >= max_no_disk_access_scans)); then
     # if unable to avoid disk access for a long time, stop going deeper and go one level up
     depth_failure_incr_counter=0
     depth_success_idle_incr_counter=0
     depth_success_busy_incr_counter=0
     (( applieddepth == 9999)) && appliedmaxdepth=$depth_max_incremental_depth || appliedmaxdepth=$((applieddepth-1))
     applieddepth=$appliedmaxdepth
+    # reset scan timeout (might have been modified by avg)
+    scan_timeout_sec=scan_timeout_sec_next
     is_initial_depth_attempt=1
     scheduled_next_depth_increment=$((scheduled_next_depth_increment_timer_duration_sec*NANO_PR_SEC+end_time))
-    log "Stopping at/decreasing to depth $appliedmaxdepth because previous scans have accessed disks/taken too long, will retry in $decreased_max_depth_rescan_wait_duration_sec secs"
-    # ALex todo set next retry attempt greater depth, eg current date + 1 week, if less than max depth
+    log "Stopping at/decreasing to depth $appliedmaxdepth because previous scans have accessed disks/taken too long, will retry in $decreased_max_depth_rescan_wait_duration_sec secs"    
+    # Alex todo set next retry attempt greater depth, eg current date + 1 week, if less than max depth
   fi
 
   # In case of reduced max depth, test if we should reset and try going deeper again
@@ -781,7 +796,9 @@ do
   fi
   fnc_time_since_last_disk_access
   ((applieddepth == appliedmaxdepth)) && next_sleed_duration=$num_seconds || next_sleed_duration=1
-  log "$start_time_txt Executed $command in ${a},$scanned_depth_msg, sleep ${next_sleed_duration}s, Disks idle time before ${disk_idle_before_scan}s, idle after ${disk_idle_after_scan}s, sharesXdisks scanned $share_disks_scanned_cnt${log_disk_access_msg}"
+  log "$start_time_txt Executed $command in ${a},$scanned_depth_msg, sleep ${next_sleed_duration}s, Disks idle time before ${disk_idle_before_scan}s, idle after ${disk_idle_after_scan}s, sharesXdisks scanned $share_disks_scanned_cnt${log_disk_access_msg}, cnt=${depth_success_idle_incr_counter}/${depth_failure_incr_counter}-$max_no_disk_access_scans"
+
+  sleep ${next_sleed_duration}
 
   # Alex: force_disk_busy_flag is unnessary when using unmount-events of unRaid 5 (as this plg-file sets up, unless this script is extracted from plg-file)
   if [ "$force_disk_busy_flag" = "yes" ]
