@@ -32,6 +32,7 @@
 alex - Unmounting disks event stop cache_dirs + StartDelayed (when mounting disks) + rc.cache_dirs changes
 2015-01-04 2.0.0-arb - cache_dir script changes - see version comments in scripts
                        PLG change: Force-disk-busy default no
+2015-02-24 2.0.2-arb - Fixed unmount problem on unraid 6 caused by looping bash-check. Fixed cache_dirs sleep and depth bugs introduced in 2.0.0
 
 This Plugin installs the cache_dirs script created by Joe L, and a start/stop script into the /etc/rc.d/unraid.d folder.
 You can manually start cache_dirs using
@@ -142,6 +143,7 @@ fi
 #                 Now stops cache_dirs immediately on stop signal (eg array stop) including stopping the currently running find-process.
 #                 Force-disk-busy now defaults no and inverted flag (and changed -B to -b) because it was (mostly) unRaid 4 and its unnessary when using plg with unmount disk event.
 # Version 2.0.1 - Fixed missing sleep. Now decreases scan-depth after few seconds (20-40s) if cache is lost after many successful cache-hits, because we don't want cache_dirs to be a resource-hog when system is otherwise occupied.
+# Version 2.0.2 - Fixed looping bash check in unRaid 6, plus fixed some too aggressive depth checks.
 # arberg
 ####################################################################################
 version=2.0.0
