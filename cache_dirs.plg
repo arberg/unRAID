@@ -167,6 +167,7 @@ usage() {
  echo " -s       =   shorter-log - print count of directories scanned to syslog instead of their names"
  echo " -d NN    =   max depth to allow when searching adaptively for appropriate depth level, used in \"find -maxdepth NN\" "
  echo " -D NN    =   sets fixed depth level and disables adaptive depth level, uses \"find -maxdepth NN\" "
+ echo " -t NN    =   time in seconds between scheduled scan towards max depth, default weekly; this setting is only relevant with adaptive scan enabled (without -D setting)"
  echo " -c command   = use command instead of \"find\" "
  echo "              ("command" should be quoted if it has embedded spaces)"
  echo " -a args    = append args to command"
@@ -258,7 +259,7 @@ syslog() {
       echo $1 | logger -t$program_name 
 }
 
-while getopts ":p:m:M:Fvc:d:D:e:qi:szl:bwuVa:SU:" opt; do
+while getopts ":p:m:M:Fvc:d:D:e:qi:szl:bwuVa:SU:t:" opt; do
   case $opt in
   m ) min_seconds=$OPTARG ;;
   M ) max_seconds=$OPTARG ;;
@@ -286,6 +287,7 @@ while getopts ":p:m:M:Fvc:d:D:e:qi:szl:bwuVa:SU:" opt; do
   b ) force_disk_busy_flag="yes" ;;
   S ) suspend_during_mover="no" ;;
   z ) concise_log="yes" ;;
+  t ) frequency_of_full_depth_scan_sec="$OPTARG" ;;
   l ) if [ "$arg_count" -ne 2 ]
       then
         echo "-l option may not be used in combination with others."
@@ -412,6 +414,13 @@ cc="$(echo $maxdepth | sed 's/[0-9]//g')"
 if [ ! -z "$cc" ]
 then
   echo "error: directory scan maxdepth must be numeric." >&2
+  usage >&2
+  exit 2
+fi
+cc="$(echo $frequency_of_full_depth_scan_sec | sed 's/[0-9]//g')"
+if [ ! -z "$cc" ]
+then
+  echo "error: scheduled rescan time must be numeric, with -t $frequency_of_full_depth_scan_sec" >&2
   usage >&2
   exit 2
 fi
@@ -666,7 +675,6 @@ do
   if [ "$suspend_during_mover"="yes" ]; then
     if [ -f /var/run/mover.pid ]; then
       if ps h `cat /var/run/mover.pid` | grep mover >/dev/null 2>&1 ; then
-        # Alex added log line
          log "Suspended during moving, now sleeping 10 seconds"
          sleep 10
          continue
@@ -677,7 +685,6 @@ do
   num_dirs=`find /mnt/disk[1-9]* /mnt/cache -type d -maxdepth 0 -print 2>/dev/null|wc -l`
   if [ "$num_dirs" -eq 0 ]
   then
-        # Alex added log line
     log "Suspended because array is not started, now sleeping 10 seconds" 
     # array is not started, sleep and look again in 10 seconds.
     sleep 10
@@ -812,17 +819,6 @@ do
         log "Stopping at/decreasing to depth $appliedmaxdepth because previous scans have accessed disks/taken too long, will retry in $decreased_max_depth_rescan_wait_duration_sec secs"    
       fi
     fi
-
-    # When reached stable level timeout will be reduced. If we have slow find (due to cache evicted) then we will have decremented depth, so now check if idle and then set timeout back to normal high value.
-    # if ((scan_timeout_sec < scan_timeout_sec_initial && applieddepth < appliedmaxdepth)); then
-    #   # Sleep 5secs and check disks idle
-    #   sleepAndCheckAreDisksIdle
-    #   if ((are_disks_idle)); then
-    #     log "Disks are idle again, so allow more time for disk-scans to regain desired depth level scan_timeout_sec ${scan_timeout_sec} -> ${scan_timeout_sec_initial}"
-    #     # disks are idle, so its ok to put load on disks again trying to regain cache
-    #     scan_timeout_sec=${scan_timeout_sec_initial}
-    #   fi
-    # fi
 
     # Weekly full scan: In case of reduced max depth, test if we should reset and try going deeper again
     if ((current_time_sec > last_scan_towards_max_depth + frequency_of_full_depth_scan_sec)) ; then
