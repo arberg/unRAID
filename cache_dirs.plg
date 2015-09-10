@@ -144,7 +144,8 @@ fi
 #                 Force-disk-busy now defaults no and inverted flag (and changed -B to -b) because it was (mostly) unRaid 4 and its unnessary when using plg with unmount disk event.
 # Version 2.0.1 - Fixed missing sleep. Now decreases scan-depth after few seconds (20-40s) if cache is lost after many successful cache-hits, because we don't want cache_dirs to be a resource-hog when system is otherwise occupied.
 # Version 2.0.2 - Fixed looping bash check in unRaid 6, plus fixed some too aggressive depth checks.
-# Version 2.0.3 - Bugfix suspend mover, and added consice log of lost cache.
+# Version 2.0.3 - Bugfix suspend mover, and added concise log of lost cache.
+# Version 2.0.4 - Added more lost cache log, enabled by creating log file /var/log/cache_dirs_lost_cache.log
 # arberg
 ####################################################################################
 version=2.0.0
@@ -210,6 +211,7 @@ user_share_dir=""
 args="-noleaf"
 concise_log="no"
 run_log="/var/log/cache_dirs.log"
+lost_cache_log="/var/log/cache_dirs_lost_cache.log"
 debug_output=0
 scan_timeout_sec_initial=600
 scan_timeout_sec_final=20
@@ -254,10 +256,26 @@ log() {
       [ "$run_log" != "" -a -f "$run_log" ] && echo $* >> $run_log
 }
 
+logLostCache() {
+      if [ "$lost_cache_log" != "" -a -f "$lost_cache_log" ] ; then
+        for var in "$@"
+        do
+          echo -n -e "$var\t"  
+        done >> $lost_cache_log
+        echo >> $lost_cache_log
+      fi
+}
+
+logLostCacheHeader() {
+      if [ "$lost_cache_log" != "" -a -f "$lost_cache_log" ] ; then
+        echo -e "Date\tTime\tScanTime\tPrevSleep\tIdleTimeBeforeScan\tDepth\tForcedRestartDepthScan" >> $lost_cache_log
+      fi
+}
+
 syslog() {
       [ $background = "no" ] && echo $1
       [ "$run_log" != "" -a -f "$run_log" ] && echo $1 >> $run_log
-      echo $1 | logger -t$program_name 
+      echo $1 | logger -t$program_name
 }
 
 while getopts ":p:m:M:Fvc:d:D:e:qi:szl:bwuVa:SU:t:" opt; do
@@ -536,6 +554,8 @@ build_dir_list() {
    echo "$scan_dirs"
 }
 
+function join { local IFS="$1"; shift; echo "$*"; }
+
 # build a command string for "at" to start later if not on-line and -w option used
 at_command=`(
 echo -n $program_dir/$program_name -w -m $min_seconds -M $max_seconds -d $maxdepth -p $cache_pressure -U $ulimit_mem
@@ -583,7 +603,7 @@ fi
 
 dir_list=`build_dir_list`
 
-if [ $short_log = "no" ]
+if [ "$short_log" = "no" ]
 then
   log_list="$dir_list"
 else
@@ -593,21 +613,26 @@ fi
 
 if [ "$concise_log" = "no" ]
 then
-echo "==============================================
-command-args=$commandargs
-vfs_cache_pressure=$cache_pressure
-max_seconds=$max_seconds, min_seconds=$min_seconds
-max_depth=$maxdepth
-command=$command $args
-version=$version
----------- caching directories ---------------
-$log_list
-----------------------------------------------" | logger -t$program_name 
+  echo "==============================================
+  command-args=$commandargs
+  vfs_cache_pressure=$cache_pressure
+  max_seconds=$max_seconds, min_seconds=$min_seconds
+  max_depth=$maxdepth
+  command=$command $args
+  version=$version
+  ---------- caching directories ---------------
+  $log_list
+  ----------------------------------------------" | logger -t$program_name 
 else
-echo "command args=$commandargs, version=$version, vfs_cache_pressure=$cache_pressure,
-max_seconds=$max_seconds, min_seconds=$min_seconds, max_depth=$maxdepth, command=$command $args
-$log_list" | paste -s -d "," - | logger -t$program_name
+  echo "command args=$commandargs, version=$version, vfs_cache_pressure=$cache_pressure,
+  max_seconds=$max_seconds, min_seconds=$min_seconds, max_depth=$maxdepth, command=$command $args
+  $log_list" | paste -s -d "," - | logger -t$program_name
 fi
+log "Setting Included dirs $(join , ${include_array[@]})"
+log "Setting Excluded dirs $(join , ${exclude_array[@]})"
+log "command-args=$commandargs"
+
+logLostCacheHeader
 
 # Create a child process with a "current working directory" on each of the disks
 # These will prevent their un-mounting, and they will prevent an unexpected surprise
@@ -673,7 +698,7 @@ max_no_disk_access_scans=3
 while [ -f "$lockfile" ]
 do
   is_last_depth_scan_timed_out=0
-  if [ "$suspend_during_mover"="yes" ]; then
+  if [ "$suspend_during_mover" = "yes" ]; then
     if [ -f /var/run/mover.pid ]; then
       if ps h `cat /var/run/mover.pid` | grep mover >/dev/null 2>&1 ; then
          log "Suspended during moving, now sleeping 10 seconds"
@@ -762,6 +787,7 @@ do
 
   do_sleep_until_disks_idle=0
   current_time_sec=$(date +%s)
+  skip_sleep=0
   if ((fixdepth == -1)); then
     # Judge last scan based on duration and timeout: Increment success or failure counters
     if ((were_disks_idle_during_scan)); then
@@ -782,10 +808,12 @@ do
       log_disk_access_msg="NonIdleTooSlow__"
       # Alex clean up (bug here? hence the log)
       log "Idle (or unknown): $elapsed_secs < $scan_judge_as_failure_sec && ! $is_last_depth_scan_timed_out || $time_since_disk_access_after_scan_sec>=$elapsed_secs"
+      logLostCache $start_time_txt ${elapsed_secs} ${prev_sleep_duration} ${time_since_disk_access_before_scan_sec} $depth_num 0
       # timeout 
       ((depth_failure_incr_counter++))
       depth_success_idle_incr_counter=0
       depth_success_busy_incr_counter=0
+      skip_sleep=1
     fi
 
     # Now increment or decrement depth level based on counters
@@ -844,17 +872,20 @@ do
   #shareDirs scanned $share_disks_scanned_cnt
   log "$start_time_txt Executed $command in (${elapsed_secs}s) ${a}, find_timeout=${is_last_depth_scan_timed_out} ${log_disk_access_msg}, $scanned_depth_msg, sleep ${next_sleep_duration}s, Disks idle before/after ${time_since_disk_access_before_scan_sec}s/${time_since_disk_access_after_scan_sec}s, suc/fail cnt=${depth_success_idle_incr_counter}/${depth_failure_incr_counter}, scan_tmo=${scan_timeout_sec}s max=$appliedmaxdepth stable=$is_stable_depth_reached"
 
-  sleep ${next_sleep_duration}
-
   if ((do_sleep_until_disks_idle)); then
     log "Pause until disks are idle again"
+    logLostCache $start_time_txt ${elapsed_secs} ${prev_sleep_duration} ${time_since_disk_access_before_scan_sec} $depth_num 1
     sleepAndCheckAreDisksIdle
     while ((!are_disks_idle)); do
       sleepAndCheckAreDisksIdle
     done
     log "Disks are idle again, so allow more time for disk-scans to regain desired depth level scan_timeout_sec ${scan_timeout_sec} -> ${scan_timeout_sec_initial}"
     do_sleep_until_disks_idle=0
+  elif ((!skip_sleep)); then
+    sleep ${next_sleep_duration}
   fi
+  prev_sleep_duration=$next_sleep_duration
+  
   # Alex: force_disk_busy_flag is unnessary when using unmount-events of unRaid 5 (as this plg-file sets up, unless this script is extracted from plg-file)
   if [ "$force_disk_busy_flag" = "yes" ]
   then
