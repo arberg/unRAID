@@ -146,6 +146,7 @@ fi
 # Version 2.0.2 - Fixed looping bash check in unRaid 6, plus fixed some too aggressive depth checks.
 # Version 2.0.3 - Bugfix suspend mover, and added concise log of lost cache.
 # Version 2.0.4 - Added more lost cache log, enabled by creating log file /var/log/cache_dirs_lost_cache.log
+# Version 2.0.5 - Updated for unRaid 6.1.2 new location of mdcmd (used to find idle-times of disks)
 # arberg
 ####################################################################################
 version=2.0.0
@@ -457,8 +458,13 @@ fnc_time_since_last_disk_access() {
   time_since_last_disk_access_sec=9999
   if [ -d /mnt/disk1 ]
   then
+    # unRaid 6.0.1 -> 6.1.2 moved mdcmd from /root/mdcmd to /usr/local/sbin/mdcmd
+    mdcmd_cmd=/usr/local/sbin/mdcmd
+    [[ ! -n $(type -P "$mdcmd_cmd") ]] && mdcmd_cmd=/root/mdcmd
+
     # rdevLastIO will be non-zero if a disk is spinning, it will be the timestamp of last IO (in seconds since epoch)
-    last=$(/root/mdcmd status | grep -a rdevLastIO | grep -v '=0')
+
+    last=$($mdcmd_cmd status | grep -a rdevLastIO | grep -v '=0')
     time_since_last_disk_access_sec=$(echo $last | awk '{t=systime(); gsub("rdevLastIO..=",""); for(i = 1; i <= NF; i++) a[++y]=$i}END{c=asort(a); if (NF > 0) print t-a[NF]; else print 9999; }')
     # Code to log all disk ages
       # ages=$(echo $last | awk '{ t=systime(); for(i = 1; i <= NF; i++){ match($i, /rdevLastIO.([0-9]+)/, capgroups); gsub("rdevLastIO..=","", $i);  print capgroups[1] "=" t-$i } }') #print "diskage" i "=" t-$i
