@@ -95,7 +95,9 @@
 #
 # dlandon
 
-# Version 2.2.0a- When cache lost, wait for disk idle >= 20secs
+# Version 2.2.0b- When cache lost, don't wait for disks idle, instead decrease depth
+#               - Weekly rescan only when disks been idle long
+#               - Apaptive scan will not retry increasing level to previous seen stable level until disks have been idle for a long time (20s)
 #               - Minor log changes for tracking possible bug (work in progress)
 #  
 # arberg
@@ -138,7 +140,7 @@ verbose=no
 min_seconds=1
 max_seconds=10
 short_log=no
-maxdepth=9999
+maxDepth=9999
 fixdepth=-1
 command="find"
 window_array_length=20
@@ -155,12 +157,23 @@ run_log="/var/log/cache_dirs.log"
 lost_cache_log="/var/log/cache_dirs_lost_cache.log"
 # When min_disk_idle_before_restarting_scan_sec was 4 it restarting scanning too soon
 min_disk_idle_before_restarting_scan_sec=20
-scan_timeout_sec_initial=600
-scan_timeout_sec_final=20
+# scan_timeout_sec_stable used for busy rescan and stable scan, scan_timeout_sec_initial_and_idle_disk_scan used for initial on disks idle scan
+scan_timeout_sec_initial_and_idle_disk_scan=600
+scan_timeout_sec_stable=20
 scan_judge_as_failure_sec=10
 # Adaptively increase depth by 1 until depth_max_incremental_depth, then go to 9999
 depth_max_incremental_depth=20
 frequency_of_full_depth_scan_sec=$((7*24*3600))
+MODE_IDLE_RESCANNING=1
+MODE_BUSY_RESCANNING=2
+MODE_EVICTED_DURING_BUSY_SCAN=3
+MODE_STABLE_AFTER_BUSY_SCAN=4
+MODE_STABLE=5
+mode=$MODE_BUSY_RESCANNING
+no_idle_scans_increase_depth=3
+no_busy_scans_increase_depth=50
+# no_slow_scans_decrease_depth was 3 and timeout=600, giving 30 minutes to read all dirs. I think that was sometimes necessary to read all, but also gives the program so much time that it will inevitably sometimes spam disks a lot when it cannot cache everything successfully. We could have separate modes for busy and idle scan, but for now I go with simplicity
+no_slow_scans_decrease_depth=2
 
 ulimit_mem=50000
 
@@ -219,7 +232,7 @@ while getopts ":p:m:M:Fvc:d:D:e:qi:szl:BbwuVa:SU:t:" opt; do
 	u )  user_share_dir="/mnt/user" ;;
 	c ) command="$OPTARG" ;;
 	a ) args="$OPTARG" ;;
-	d ) maxdepth=$OPTARG
+	d ) maxDepth=$OPTARG
 	  command="find" ;;
 	D ) fixdepth=$OPTARG
 	  command="find" ;;
@@ -279,7 +292,7 @@ else
 	log "No Memory ulimit applied"
 fi
 
-log "Setting maxdepth=$maxdepth"
+log "Setting maxdepth=$maxDepth"
 
 lockfile="/var/lock/cache_dirs.LCK"
 if [ -f "${lockfile}" ] ; then
@@ -351,8 +364,8 @@ if [ $max_seconds -lt $min_seconds ] ; then
 	exit 2
 fi
 
-# validate the maxdepth
-cc="$(echo $maxdepth | sed 's/[0-9]//g')"
+# validate the maxDepth
+cc="$(echo $maxDepth | sed 's/[0-9]//g')"
 if [ ! -z "$cc" ] ; then
 	echo "error: directory scan maxdepth must be numeric." >&2
 	usage >&2
@@ -487,7 +500,7 @@ fi
 
 if ((fixdepth == -1)) ; then
 	scan_type="adaptive"
-	scan_depth=$maxdepth
+	scan_depth=$maxDepth
 else
 	scan_type="fixed"
 	scan_depth=$fixdepth
@@ -543,25 +556,30 @@ do
 done
 
 # Internal vars
+# isPreviousMaxDepthComputed will be true(1) if we have reached the depth we currently think of as our max depth, ie. appliedDepth == appliedMaxDepth
+# - appliedMaxDepth is computed once, and after that we always try to regain that depth, which would cause load on system, unless we wait for idle disks I suppose
 depth_success_idle_incr_counter=0
 depth_success_busy_incr_counter=0
 depth_failure_incr_counter=0
 if ((fixdepth >= 0)) ; then
-	applieddepth=$fixdepth
-	maxdepth=$fixdepth
-	is_stable_depth_reached=1
-	scan_timeout_sec=${scan_timeout_sec_final}
+	appliedDepth=$fixdepth
+	maxDepth=$fixdepth
+	isPreviousMaxDepthComputed=1
+	scan_timeout_sec=${scan_timeout_sec_stable}
 else
-	applieddepth=0
-	scan_timeout_sec=${scan_timeout_sec_initial}
-	is_stable_depth_reached=0
+	appliedDepth=0
+	scan_timeout_sec=${scan_timeout_sec_initial_and_idle_disk_scan}
+	isPreviousMaxDepthComputed=0
 fi
 
-appliedmaxdepth=$maxdepth
+# invariant appliedMaxDepthCurrent < appliedMaxDepth <= maxDepth
+# appliedMaxDepthCurrent: Current stable set, will be increased after long disk idle
+# appliedMaxDepth: Best seen appliedMaxDepth, reset once a week
+# maxDepth: User configured max depth
+appliedMaxDepth=$maxDepth
+appliedMaxDepthCurrent=$appliedMaxDepth
 last_scan_towards_max_depth=$(date +%s)
 
-# max allowed scans with disk-access before we stop/decrease depth
-max_no_disk_access_scans=3
 while [ -f "$lockfile" ]
 do
 	is_last_depth_scan_timed_out=0
@@ -589,7 +607,7 @@ do
 	scanned_depth_msg=""
 
 	############## Here the actual find is executed ################
-	do_deep_scan $applieddepth $scan_timeout_sec
+	do_deep_scan $appliedDepth $scan_timeout_sec
 	# I tried rescan at lower depth if scan timed out, but it hurt cache, some depth levels were unattainable with the lower depth scan enabled, they must have evicted higher depth cache for some reason
 
 	time_since_disk_access_after_scan_sec=$(fnc_time_since_last_disk_access)
@@ -641,7 +659,6 @@ do
 
 	log_disk_access_msg=""
 
-	do_sleep_until_disks_idle=0
 	current_time_sec=$(date +%s)
 	skip_sleep=0
 	if ((fixdepth == -1)) ; then
@@ -655,7 +672,7 @@ do
 			if (( elapsed_time <= avg_elapsed_time + 2*NANO_PR_SEC )) ; then
 				# depth_failure_incr_counter because we suspect its a scan which didn't access disks, since scan time was as fast as usual.
 				depth_failure_incr_counter=0
-				log_disk_access_msg="NonIdleUsualTime"
+				log_disk_access_msg="NonIdleFast_____"
 			else
 				log_disk_access_msg="NonIdleSlowerAvg"
 			fi
@@ -674,47 +691,64 @@ do
 			skip_sleep=1
 		fi
 
+		time_since_last_disk_access_sec=$(fnc_time_since_last_disk_access)
+		(( time_since_last_disk_access_sec >= min_disk_idle_before_restarting_scan_sec )) && hasBeenIdleLong=1 || hasBeenIdleLong=0
 		# Now increment or decrement depth level based on counters
-		if ((applieddepth < appliedmaxdepth && (depth_success_idle_incr_counter>=3 || is_stable_depth_reached && depth_success_idle_incr_counter>=1 || depth_success_busy_incr_counter > 50) )) ; then
-			# Increment depth
-			(( applieddepth++ ))
-			depth_failure_incr_counter=0
-			depth_success_idle_incr_counter=0
-			depth_success_busy_incr_counter=0
-			# skip straight to 9999 if deep enough, so we can start sleeping
-			(( applieddepth > depth_max_incremental_depth )) && applieddepth=$maxdepth
-			if (( applieddepth >= appliedmaxdepth )) ; then
-				is_stable_depth_reached=1
-				scan_timeout_sec=${scan_timeout_sec_final}
+		if (( depth_success_idle_incr_counter >= no_idle_scans_increase_depth || depth_success_idle_incr_counter >= 1  && hasBeenIdleLong || depth_success_busy_incr_counter > no_busy_scans_increase_depth )) ; then
+			if (( appliedDepth == appliedMaxDepthCurrent )) ; then
+				# set isPreviousMaxDepthComputed in case appliedMaxDepthCurrent is still maxDepth, thus its the first time we get here
+				isPreviousMaxDepthComputed=1
+				scan_timeout_sec=${scan_timeout_sec_stable}
+				mode=MODE_STABLE
 			fi
-		elif ((depth_failure_incr_counter >= max_no_disk_access_scans && applieddepth > 0)) ; then
+			if (( appliedDepth < appliedMaxDepthCurrent || appliedDepth < appliedMaxDepth && hasBeenIdleLong)) ; then
+				# Increment depth and check depth_max_incremental_depth: skip straight to 9999 if deep enough, so we can start sleeping
+				(( appliedDepth++ ))
+				(( appliedDepth > depth_max_incremental_depth )) && appliedDepth=$maxDepth
+				depth_failure_incr_counter=0
+				depth_success_idle_incr_counter=0
+				depth_success_busy_incr_counter=0
+				if (( appliedDepth > appliedMaxDepthCurrent )) ; then	
+					appliedMaxDepthCurrent=$appliedMaxDepth
+					# we just incremented level due to idle disks, allow more time for scanning
+					scan_timeout_sec=${scan_timeout_sec_initial_and_idle_disk_scan}
+					mode=MODE_IDLE_RESCANNING
+				fi
+			fi
+		elif (( appliedDepth > 0 && depth_failure_incr_counter >= no_slow_scans_decrease_depth )) ; then
 			depth_failure_incr_counter=0
 			depth_success_idle_incr_counter=0
 			depth_success_busy_incr_counter=0
-			if (( is_stable_depth_reached )) ; then
-				# Reset depth to 1: It will only increase again once we have enough idle with successive scans
-				do_sleep_until_disks_idle=1
-				scan_timeout_sec=${scan_timeout_sec_initial}
-				applieddepth=1
-			# fi
-			else
-				# Decrement max depth, because we were finding the possible stable level, so we now set the appliedmaxdepth which acts as our upper bound
-				(( applieddepth == 9999)) && appliedmaxdepth=$depth_max_incremental_depth || appliedmaxdepth=$((applieddepth-1))
-				applieddepth=$appliedmaxdepth
-				is_stable_depth_reached=1
-				scan_timeout_sec=${scan_timeout_sec_final}
-				log "Stopping at/decreasing to depth $appliedmaxdepth because previous scans have accessed disks/taken too long, will retry in $decreased_max_depth_rescan_wait_duration_sec secs"
-		 	fi
+			# Reduce max-depth
+			(( appliedDepth == 9999)) && appliedMaxDepthCurrent=$depth_max_incremental_depth || appliedMaxDepthCurrent=$((appliedDepth-1))
+			appliedDepth=$appliedMaxDepthCurrent
+			scan_timeout_sec=${scan_timeout_sec_stable}
+			logLostCache $start_time_txt ${elapsed_secs} ${prev_sleep_duration} ${time_since_disk_access_before_scan_sec} $depth_num 1
+			if (( mode == MODE_STABLE )) ; then
+				mode=MODE_BUSY_RESCANNING
+				appliedDepth=0
+			else 
+				mode=MODE_EVICTED_DURING_BUSY_SCAN
+				if (( !isPreviousMaxDepthComputed )) ; then
+					# Reduce the max-depth which is recomputed weekly (appliedMaxDepthCurrent has already been decreased)
+					# Decrement max depth, because we were finding the possible stable level, so we now set the appliedMaxDepth which acts as our upper bound
+					appliedMaxDepth=$appliedMaxDepthCurrent
+					# The previous depth was stable, so set isPreviousMaxDepthComputed
+					isPreviousMaxDepthComputed=1
+					log "Stopping at/decreasing to depth $appliedMaxDepth because previous scans have accessed disks/taken too long, will retry in $decreased_max_depth_rescan_wait_duration_sec secs"
+			 	fi
+			fi
 		fi
 
 		# Weekly full scan: In case of reduced max depth, test if we should reset and try going deeper again
-		if ((current_time_sec > last_scan_towards_max_depth + frequency_of_full_depth_scan_sec)) ; then
+		time_since_last_disk_access_sec=$(fnc_time_since_last_disk_access)
+		if (( current_time_sec > last_scan_towards_max_depth + frequency_of_full_depth_scan_sec && time_since_last_disk_access_sec >= min_disk_idle_before_restarting_scan_sec )) ; then
 			last_scan_towards_max_depth=$current_time
-			if (( appliedmaxdepth < maxdepth )) ; then
-				log "Starting scheduled depth scan again after waiting ${frequency_of_full_depth_scan_sec}s"
-				appliedmaxdepth=$maxdepth
-				is_stable_depth_reached=0
-				scan_timeout_sec=${scan_timeout_sec_initial}
+			if (( appliedMaxDepth < maxDepth )) ; then
+				log "Starting scheduled depth scan again after waiting ${frequency_of_full_depth_scan_sec}s - disks have been idle for ${time_since_last_disk_access_sec}s"
+				appliedMaxDepth=$maxDepth
+				isPreviousMaxDepthComputed=0
+				scan_timeout_sec=${scan_timeout_sec_initial_and_idle_disk_scan}
 			fi
 		fi
 	fi
@@ -724,22 +758,10 @@ do
 	if [ "$background" = "no" -o "$run_log" != "" ] ; then
 		a=`awk "BEGIN{ printf \\"%05.2fs, wavg=%05.2fs\n\\", ($elapsed_time/1000000000), ($avg_elapsed_time/1000000000) ; }"`
 	fi
-	((applieddepth == appliedmaxdepth)) && next_sleep_duration=$num_seconds || next_sleep_duration=1
+	((appliedDepth == appliedMaxDepth)) && next_sleep_duration=$num_seconds || next_sleep_duration=1
 	#shareDirs scanned $share_disks_scanned_cnt
-	log "$start_time_txt Executed $command in (${elapsed_secs}s) ${a}, find_timeout=${is_last_depth_scan_timed_out} ${log_disk_access_msg}, $scanned_depth_msg, sleep ${next_sleep_duration}s, Disks idle before/after ${time_since_disk_access_before_scan_sec}s/${time_since_disk_access_after_scan_sec}s, suc/fail cnt=${depth_success_idle_incr_counter}/${depth_failure_incr_counter}, scan_tmo=${scan_timeout_sec}s max=$appliedmaxdepth stable=$is_stable_depth_reached"
-
-	if ((do_sleep_until_disks_idle)) ; then
-		log "Pause until disks are idle again"
-		logLostCache $start_time_txt ${elapsed_secs} ${prev_sleep_duration} ${time_since_disk_access_before_scan_sec} $depth_num 1
-
-		while : ; do
-			sleep 5
-			time_since_last_disk_access_sec=$(fnc_time_since_last_disk_access)
-		    (( time_since_last_disk_access_sec >= min_disk_idle_before_restarting_scan_sec )) && break
-		done
-		log "Disks idle for ${time_since_last_disk_access_sec}s, restarting scan. Scan timeout set to ${scan_timeout_sec}"
-		do_sleep_until_disks_idle=0
-	elif ((!skip_sleep)) ; then
+	log "$start_time_txt Executed $command in (${elapsed_secs}s) ${a}, find_timeout=${is_last_depth_scan_timed_out} ${log_disk_access_msg}, $scanned_depth_msg, sleep ${next_sleep_duration}s, Disks idle before/after ${time_since_disk_access_before_scan_sec}s/${time_since_disk_access_after_scan_sec}s, suc/fail cnt=${depth_success_idle_incr_counter}/${depth_failure_incr_counter}, scan_tmo=${scan_timeout_sec}s maxCur=$appliedMaxDepthCurrent maxWeek=$appliedMaxDepth stable=$isPreviousMaxDepthComputed"
+	if ((!skip_sleep)) ; then
 		sleep ${next_sleep_duration}
 	fi
 	prev_sleep_duration=$next_sleep_duration
