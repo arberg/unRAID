@@ -162,8 +162,9 @@ run_log="/var/log/cache_dirs.log"
 lost_cache_log="/var/log/cache_dirs_lost_cache.log"
 # When min_disk_idle_before_restarting_scan_sec was 4 it restarting scanning too soon
 min_disk_idle_before_restarting_scan_sec=20
-# scan_timeout_sec_stable used for busy rescan and stable scan, scan_timeout_sec_initial_and_idle_disk_scan used for initial on disks idle scan
-scan_timeout_sec_initial_and_idle_disk_scan=100
+# scan_timeout_sec_stable used for busy rescan and stable scan, scan_timeout_sec_idle used for initial on disks idle scan
+scan_timeout_sec_busy=30
+scan_timeout_sec_idle=100
 scan_timeout_sec_previous_depth=50
 scan_timeout_sec_stable=20
 scan_judge_as_failure_sec=10
@@ -172,7 +173,7 @@ depth_max_incremental_depth=20
 frequency_of_full_depth_scan_sec=$((7*24*3600))
 MODE_IDLE_RESCANNING=1
 MODE_BUSY_RESCANNING=2
-MODE_EVICTED_DURING_BUSY_SCAN=3
+#MODE_EVICTED_DURING_BUSY_SCAN=3
 MODE_STABLE=4
 mode=$MODE_BUSY_RESCANNING
 no_idle_scans_increase_depth=3
@@ -621,10 +622,10 @@ if ((fixdepth >= 0)) ; then
 	appliedDepth=$fixdepth
 	maxDepth=$fixdepth
 	isPreviousMaxDepthComputed=1
-	scan_timeout_sec=${scan_timeout_sec_stable}
+	scan_timeout_sec=${scan_timeout_sec_idle}
 else
 	appliedDepth=0
-	scan_timeout_sec=${scan_timeout_sec_initial_and_idle_disk_scan}
+	scan_timeout_sec=${scan_timeout_sec_busy}
 	isPreviousMaxDepthComputed=0
 fi
 
@@ -650,8 +651,7 @@ do
 	fi
 
 	start_time_nano=$(date +%s%N)
-	start_time_txt=$(date "+%Y.%m.%d %H:%M:%S")
-	
+	start_time_txt=$(date "+%Y.%m.%d %H:%M:%S")	
 	time_since_disk_access_before_scan_sec=$(fnc_time_since_last_disk_access)
 
 	# always cache root dirs on each of the disks
@@ -664,18 +664,25 @@ do
 	while (( is_last_depth_scan_timed_out )) ; do
 		# Do deep scan of last depth due to timeout, in the hope of keeping previous cache
 		do_deep_scan "$(depthMinusOne $appliedDepth)" "$scan_timeout_sec_previous_depth"
+		end_time_nano=$(date +%s%N)
+		elapsed_time=$(( end_time_nano-start_time_nano ))
+		elapsed_secs=$(( elapsed_time/NANO_PR_SEC ))
+		time_since_disk_access_after_scan_sec=$(fnc_time_since_last_disk_access)
+		log "$start_time_txt Executed $command in (${elapsed_secs}s) ${a}, find_timeout=${is_last_depth_scan_timed_out} ${log_disk_access_msg}, $scanned_depth_msg, sleep ${next_sleep_duration}s, Disks idle before/after ${time_since_disk_access_before_scan_sec}s/${time_since_disk_access_after_scan_sec}s, suc/fail cnt=${depth_success_idle_incr_counter}/${depth_failure_incr_counter}, scan_tmo=${scan_timeout_sec}s maxCur=$appliedMaxDepthCurrent maxWeek=$appliedMaxDepth stable=$isPreviousMaxDepthComputed"
 		if (( is_last_depth_scan_timed_out )) ; then
 			appliedDepth=$(depthMinusOne $appliedDepth)
 			# Don't reset counters, esp. failure counter, because then we might dance up and down forever
 		fi
 	done
+	start_time_nano=$(date +%s%N)
+	start_time_txt=$(date "+%Y.%m.%d %H:%M:%S")
+	time_since_disk_access_before_scan_sec=$(fnc_time_since_last_disk_access)
 
 	scanned_depth_msg=""
 	do_deep_scan $appliedDepth $scan_timeout_sec
 	# I tried rescan at lower depth if scan timed out, but it hurt cache, some depth levels were unattainable with the lower depth scan enabled, they must have evicted higher depth cache for some reason
 
 	time_since_disk_access_after_scan_sec=$(fnc_time_since_last_disk_access)
-
 	end_time_nano=$(date +%s%N)
 
 	# track how long the recursive "directory scan" is taking.  If it starts to take longer it must be
@@ -761,6 +768,10 @@ do
 
 		time_since_last_disk_access_sec=$(fnc_time_since_last_disk_access)
 		(( time_since_last_disk_access_sec >= min_disk_idle_before_restarting_scan_sec )) && hasBeenIdleLong=1 || hasBeenIdleLong=0
+		if (( hasBeenIdleLong && mode == MODE_BUSY_RESCANNING)) ; then
+			mode = MODE_IDLE_RESCANNING
+			scan_timeout_sec=${scan_timeout_sec_idle}
+		fi
 		# Now increment or decrement depth level based on counters
 		if (( depth_success_idle_incr_counter >= no_idle_scans_increase_depth || depth_success_idle_incr_counter >= 1  && hasBeenIdleLong || depth_success_busy_incr_counter > no_busy_scans_increase_depth )) ; then
 			if (( appliedDepth == appliedMaxDepthCurrent )) ; then
@@ -778,7 +789,7 @@ do
 				if (( appliedDepth > appliedMaxDepthCurrent )) ; then	
 					appliedMaxDepthCurrent=$appliedMaxDepth
 					# we just incremented level due to idle disks, allow more time for scanning
-					scan_timeout_sec=${scan_timeout_sec_initial_and_idle_disk_scan}
+					scan_timeout_sec=${scan_timeout_sec_idle}
 					mode=MODE_IDLE_RESCANNING
 				fi
 			fi
@@ -789,14 +800,14 @@ do
 			# Reduce max-depth
 			appliedDepth=$(depthMinusOne $appliedDepth)
 			appliedMaxDepthCurrent=$appliedDepth
-			scan_timeout_sec=${scan_timeout_sec_stable}
+			scan_timeout_sec=${scan_timeout_sec_busy}
 			logLostCache $start_time_txt ${elapsed_secs} ${prev_sleep_duration} ${time_since_disk_access_before_scan_sec} $depth_num 1
 			if (( mode == MODE_STABLE )) ; then
 				mode=MODE_BUSY_RESCANNING
 				appliedDepth=0
 			else 
-				mode=MODE_EVICTED_DURING_BUSY_SCAN
-				if (( !isPreviousMaxDepthComputed )) ; then
+				if (( !isPreviousMaxDepthComputed && mode = MODE_IDLE_RESCANNING )) ; then
+					mode == MODE_STABLE
 					# Reduce the max-depth which is recomputed weekly (appliedMaxDepthCurrent has already been decreased)
 					# Decrement max depth, because we were finding the possible stable level, so we now set the appliedMaxDepth which acts as our upper bound
 					appliedMaxDepth=$appliedMaxDepthCurrent
@@ -815,7 +826,7 @@ do
 				log "Starting scheduled depth scan again after waiting ${frequency_of_full_depth_scan_sec}s - disks have been idle for ${time_since_last_disk_access_sec}s"
 				appliedMaxDepth=$maxDepth
 				isPreviousMaxDepthComputed=0
-				scan_timeout_sec=${scan_timeout_sec_initial_and_idle_disk_scan}
+				scan_timeout_sec=${scan_timeout_sec_idle}
 			fi
 		fi
 	fi
@@ -841,8 +852,6 @@ done &
 # to get it to stop, type: rm /var/lock/cache_dirs.LCK
 background_pid=$!
 echo $background_pid > "${lockfile}"
-echo "background_pid=$background_pid"
-log "background_pid=$background_pid"
 if [ $background = "no" ] ; then
 	# only way to get here is to remove the lock file or kill the background process shell with the while loop
 	trap "rm -f $lockfile; killtree $background_pid -KILL 2>/dev/null; exit" INT TERM EXIT
