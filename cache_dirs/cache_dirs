@@ -1,5 +1,8 @@
 #!/bin/bash
 
+#Programmer notes
+# Check with https://www.shellcheck.net/
+
 ####################################################################################
 # cache_dirs
 # A utility to attempt to keep directory entries in the linux
@@ -124,7 +127,7 @@ usage() {
 	echo " -D NN    =   sets fixed depth level and disables adaptive depth level, uses \"find -maxdepth NN\" "
 	echo " -t NN    =   time in seconds between scheduled scan towards max depth, default weekly; this setting is only relevant with adaptive scan enabled (without -D setting)"
 	echo " -c command = use command instead of \"find\" "
-	echo "              ("command" should be quoted if it has embedded spaces)"
+	echo "              (\"command\" should be quoted if it has embedded spaces)"
 	echo " -a args  =   append args to command"
 	echo " -u       =   also scan /mnt/user (scan user shares)"
 	echo " -e exclude_dir  (may be repeated as many times as desired)"
@@ -167,8 +170,7 @@ frequency_of_full_depth_scan_sec=$((7*24*3600))
 MODE_IDLE_RESCANNING=1
 MODE_BUSY_RESCANNING=2
 MODE_EVICTED_DURING_BUSY_SCAN=3
-MODE_STABLE_AFTER_BUSY_SCAN=4
-MODE_STABLE=5
+MODE_STABLE=4
 mode=$MODE_BUSY_RESCANNING
 no_idle_scans_increase_depth=3
 no_busy_scans_increase_depth=50
@@ -191,16 +193,16 @@ NANO_PR_SEC=1000000000
 cache_pressure=10
 
 verbose_echo() {
-	[ $background = "no" -a $verbose = "yes" ] && echo $1
+	[ $background = "no" ] && [ $verbose = "yes" ] && echo $1
 }
 
 log() {
-	[ $background = "no" -a $verbose = "yes" ] && echo $*
-	[ "$run_log" != "" -a -f "$run_log" ] && echo $* >> $run_log
+	[ $background = "no" ] && [ $verbose = "yes" ] && echo $*
+	[ "$run_log" != "" ] && [ -f "$run_log" ] && echo $* >> $run_log
 }
 
 logLostCache() {
-	if [ "$lost_cache_log" != "" -a -f "$lost_cache_log" ] ; then
+	if [ "$lost_cache_log" != "" ] && [ -f "$lost_cache_log" ] ; then
 		for var in "$@"
 		do
 			echo -n -e "$var\t"
@@ -210,14 +212,14 @@ logLostCache() {
 }
 
 logLostCacheHeader() {
-	if [ "$lost_cache_log" != "" -a -f "$lost_cache_log" ] ; then
+	if [ "$lost_cache_log" != "" ] && [ -f "$lost_cache_log" ] ; then
 		echo -e "Date\tTime\tScanTime\tPrevSleep\tIdleTimeBeforeScan\tDepth\tForcedRestartDepthScan" >> $lost_cache_log
 	fi
 }
 
 syslog() {
 	[ $background = "no" ] && echo $1
-	[ "$run_log" != "" -a -f "$run_log" ] && echo $1 >> $run_log
+	[ "$run_log" != "" ] && [ -f "$run_log" ] && echo $1 >> $run_log
 	echo $1 | logger -t$program_name
 }
 
@@ -652,10 +654,14 @@ do
 	[ $avg_elapsed_time -eq 0 ] && avg_elapsed_time=$elapsed_time
 
 	# Only decrease sleep when non-idle scan
-	((were_disks_idle_during_scan)) && [ $avg_elapsed_time -lt $(($elapsed_time+100000)) -a $num_seconds -gt $min_seconds ] && num_seconds=$(($num_seconds-1))
-	[ $avg_elapsed_time -gt $(($elapsed_time-100000)) -a $num_seconds -lt $max_seconds ] && num_seconds=$(($num_seconds+1))
+	if (( were_disks_idle_during_scan && avg_elapsed_time < elapsed_time + 100000 && num_seconds > min_seconds )) ; then
+		num_seconds=$((num_seconds-1))
+	fi
+	if (( avg_elapsed_time > elapsed_time - 100000 && num_seconds < max_seconds )) ; then
+		num_seconds=$(($num_seconds+1))
+	fi
 
-	avg_elapsed_secs=$(( $avg_elapsed_time/1000000000 ))
+	avg_elapsed_secs=$(( avg_elapsed_time/1000000000 ))
 
 	log_disk_access_msg=""
 
@@ -743,7 +749,7 @@ do
 		# Weekly full scan: In case of reduced max depth, test if we should reset and try going deeper again
 		time_since_last_disk_access_sec=$(fnc_time_since_last_disk_access)
 		if (( current_time_sec > last_scan_towards_max_depth + frequency_of_full_depth_scan_sec && time_since_last_disk_access_sec >= min_disk_idle_before_restarting_scan_sec )) ; then
-			last_scan_towards_max_depth=$current_time
+			last_scan_towards_max_depth=$current_time_sec
 			if (( appliedMaxDepth < maxDepth )) ; then
 				log "Starting scheduled depth scan again after waiting ${frequency_of_full_depth_scan_sec}s - disks have been idle for ${time_since_last_disk_access_sec}s"
 				appliedMaxDepth=$maxDepth
@@ -755,7 +761,7 @@ do
 
 	# Alex changed logging for applied depth and no sleep
 	# log duration
-	if [ "$background" = "no" -o "$run_log" != "" ] ; then
+	if [ "$background" = "no" ] || [ "$run_log" != "" ] ; then
 		a=`awk "BEGIN{ printf \\"%05.2fs, wavg=%05.2fs\n\\", ($elapsed_time/1000000000), ($avg_elapsed_time/1000000000) ; }"`
 	fi
 	((appliedDepth == appliedMaxDepth)) && next_sleep_duration=$num_seconds || next_sleep_duration=1
