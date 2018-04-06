@@ -1,4 +1,18 @@
 # unRAID
-(My modifications made public of) Plugins for unRAID
+Plugins for unRAID
 
-cache_dirs.plg: Webpage in unraid webgui > settings does not work on unRaid 6 (x64).
+## Cache Dirs
+
+
+### unRAID Plugin
+
+The Dynamix Plugin is available in unRaid App menu
+
+[unRAID forum: Dynamix Support Thread](https://lime-technology.com/forums/topic/34889-dynamix-v6-plugins/)
+[GitHub: Dynamix Plugin](https://github.com/bergware/dynamix)
+
+### Release repository
+
+[dlandon/cache_dirs](https://github.com/dlandon/cache_dirs)
+https://github.com/dlandon/cache_dirs
+
