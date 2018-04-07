@@ -551,6 +551,33 @@ do_deep_scan() {
 	fi
 }
 
+
+# does not work as function that echo result, missing cpu_last
+# First cpu measurement will be wrong, missing last
+update_cpu_usage() {
+	cpu_now=($(head -n1 /proc/stat)) 
+	# Get all columns but skip the first (which is the "cpu" string) 
+	cpu_sum="${cpu_now[@]:1}" 
+	# Replace the column seperator (space) with + 
+	cpu_sum=$((${cpu_sum// /+})) 
+	# Get the delta between two reads 
+	cpu_delta=$((cpu_sum - cpu_last_sum)) 
+	# Get the idle time Delta 
+	cpu_idle=$((cpu_now[4]- cpu_last[4])) 
+	# Calc time spent working 
+	cpu_used=$((cpu_delta - cpu_idle)) 
+	# Calc percentage 
+	cpu_usage=$((100 * cpu_used / cpu_delta)) 
+
+    # Keep this as last for our next read 
+    cpu_last=("${cpu_now[@]}") 
+    cpu_last_sum=$cpu_sum
+}
+
+format_two_digit() {
+	echo "$(echo $1 | awk '{input=$1} END {printf "%2.0f", input}')"
+}
+
 # will update dir_list on each scan, in case new shares have been added
 dir_list=$(build_dir_list)
 
@@ -726,9 +753,10 @@ do
 			tot_time=$(( $tot_time + $(( ${avg[$i]} * $weight ))))
 		done
 		avg_elapsed_time=$(($tot_time/$tot_count))
+	elif [ $avg_elapsed_time -eq 0 ] ; then
+		avg_elapsed_time=$elapsed_time
 	fi
-
-	[ $avg_elapsed_time -eq 0 ] && avg_elapsed_time=$elapsed_time
+	avg_elapsed_secs=$(( avg_elapsed_time / NANO_PR_SEC ))
 
 	# Only decrease sleep when non-idle scan, note avg is computed over scan with idle disks, but not necessary at current depth level
 	if (( !were_disks_idle_during_scan && avg_elapsed_time * 3 < elapsed_time && num_seconds > min_seconds )) ; then
@@ -738,7 +766,6 @@ do
 		num_seconds=$max_seconds
 	fi
 
-	avg_elapsed_secs=$(( avg_elapsed_time / NANO_PR_SEC ))
 
 	log_disk_access_msg=""
 
@@ -850,8 +877,12 @@ do
 	fi
 
 	((appliedDepth == appliedMaxDepth)) && next_sleep_duration=$num_seconds || next_sleep_duration=1
-	CPU=$(grep 'cpu ' /proc/stat | awk '{usage=($2+$4)*100/($2+$4+$5)} END {printf "%2.0f%", usage}')
-	log "$start_time_txt Executed $command in (${elapsed_secs}s) ${a}, find_timeout=${is_last_depth_scan_timed_out} ${log_disk_access_msg}, $scanned_depth_msg, sleep ${next_sleep_duration}s, Disks idle before/after ${time_since_disk_access_before_scan_sec}s/${time_since_disk_access_after_scan_sec}s, suc/fail cnt=${depth_success_idle_incr_counter}/${depth_failure_incr_counter}, scan_tmo=${scan_timeout_sec}s maxCur=$appliedMaxDepthCurrent maxWeek=$appliedMaxDepth stable=$isPreviousMaxDepthComputed CPU=$CPU"
+	update_cpu_usage
+	CPU="$(format_two_digit $cpu_usage)"
+	# avg_text=`awk "BEGIN{ printf \\"%05.2fs, wavg=%05.2fs\n\\", ($elapsed_time/1000000000), ($avg_elapsed_time/1000000000) ; }"`
+	avg_text=$(awk "BEGIN{ printf \"%05.2fs, wavg=%05.2fs\n\", ($elapsed_time/1000000000), ($avg_elapsed_time/1000000000) ; }")
+	#avg_text=$(awk "BEGIN{ printf \"%05.2fs, wavg=%05.2fs\n\", $elapsed_secs, $avg_elapsed_secs ; }")
+	log "$start_time_txt Executed $command in (${elapsed_secs}s) $avg_text, ${log_disk_access_msg}, $scanned_depth_msg, sleep ${next_sleep_duration}s, Disks idle before/after ${time_since_disk_access_before_scan_sec}s/${time_since_disk_access_after_scan_sec}s, suc/fail cnt=${depth_success_idle_incr_counter}/${depth_failure_incr_counter}, scan_tmo=${scan_timeout_sec}s maxCur=$appliedMaxDepthCurrent maxWeek=$appliedMaxDepth stable=$isPreviousMaxDepthComputed CPU=${CPU}%"
 	# we only skip sleep when scan is taking long, so it cannot significantly change impact whether or not we sleep 1 sec. We skip sleep to help cache pressure to build
 	if ((!skip_sleep)) ; then
 		sleep ${next_sleep_duration}
