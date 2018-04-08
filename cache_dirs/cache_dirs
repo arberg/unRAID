@@ -106,7 +106,7 @@
 #               - Minor log changes for tracking possible bug (work in progress)
 # arberg
 ####################################################################################
-version=2.2.0c
+version=2.2.0d
 program_name=$(basename "$0")
 arg_count=$#
 
@@ -340,6 +340,7 @@ else
 	fi
 fi
 
+log "$program_name version $version"
 #Try to play nice
 if [ "$ulimit_mem" -gt 0 ] ; then
 	log "Setting Memory ulimit to $ulimit_mem"
